@@ -1,23 +1,23 @@
-require('dotenv').config();   // still useful locally, but on Vercel use env vars
+require('dotenv').config(); // still useful locally, but on Vercel use env vars
 
-const express  = require('express');
-const mongoose = require('mongoose');
-const bcrypt   = require('bcryptjs');
-const jwt      = require('jsonwebtoken');
-const cors     = require('cors');
-const multer   = require('multer');
-const path     = require('path');
+const express    = require('express');
+const mongoose   = require('mongoose');
+const bcrypt     = require('bcryptjs');
+const jwt        = require('jsonwebtoken');
+const cors       = require('cors');
+const multer     = require('multer');
+const path       = require('path');
 const cloudinary = require('cloudinary').v2;
 
-const app  = express();
+const app = express();
 
-// ── Middleware ─────────────────────────────────────────────────────────────────
+// ── Basic Middleware ───────────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
 
 // ── Check JWT secret ───────────────────────────────────────────────────────────
 if (!process.env.JWT_SECRET) {
-  console.error('❌  JWT_SECRET is not defined in .env file');
+  console.error('❌  JWT_SECRET is not defined');
   process.exit(1);
 }
 
@@ -33,7 +33,7 @@ const memoryStorage = multer.memoryStorage();
 
 const upload = multer({
   storage: memoryStorage,
-  limits: { fileSize: 5 * 1024 * 1024 },  // 5 MB for profile photos
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
   fileFilter: (_req, file, cb) => {
     const isImage = /\.(jpe?g|png|gif|webp)$/i.test(file.originalname);
     isImage ? cb(null, true) : cb(new Error('Only image files (jpg, png, gif, webp) are allowed.'));
@@ -42,35 +42,60 @@ const upload = multer({
 
 const uploadAppDocs = multer({
   storage: memoryStorage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB per file
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
   fileFilter: (_req, file, cb) => {
     const allowed = /\.(pdf|jpe?g|png|gif|webp)$/i;
     allowed.test(path.extname(file.originalname))
       ? cb(null, true)
-      : cb(new Error('Only PDF and image files (jpg, png, gif, webp) are allowed.'));
+      : cb(new Error('Only PDF and image files are allowed.'));
   },
 }).array('documents', 5);
 
-// ── MongoDB Connection ─────────────────────────────────────────────────────────
+// ── MongoDB connection setup ───────────────────────────────────────────────────
 const MONGO_URI = process.env.MONGO_URI;
 if (!MONGO_URI) {
   console.error('❌ MONGO_URI is not set');
   process.exit(1);
 }
 
-// (Mongoose connection will be established later)
+let cachedDb = null;
 
-// ── Schemas (unchanged except document array stores URLs now) ──────────────────
+async function connectToDatabase() {
+  // Re-use existing connection if healthy
+  if (cachedDb && mongoose.connection.readyState === 1) {
+    return cachedDb;
+  }
+  await mongoose.connect(MONGO_URI, {
+    serverSelectionTimeoutMS: 10000, // fail fast on cold start issues
+  });
+  cachedDb = mongoose.connection;
+  console.log('✅ MongoDB connected');
+  return cachedDb;
+}
 
+// ── DB connection middleware ─────────────────────────────────────────────
+// ✅ CRITICAL: This must be registered BEFORE any routes so every
+//    request waits for the DB to be ready (important for Vercel cold starts).
+app.use(async (req, res, next) => {
+  try {
+    await connectToDatabase();
+    next();
+  } catch (err) {
+    console.error('MongoDB connection error:', err);
+    res.status(500).json({ message: 'Database connection failed' });
+  }
+});
+
+// ── Schemas ────────────────────────────────────────────────────────────────────
 const userSchema = new mongoose.Schema(
   {
-    fullName: { type: String, required: true, trim: true },
-    email:    { type: String, required: true, unique: true, lowercase: true, trim: true,
-                match: [/^\S+@\S+\.\S+$/, 'Please enter a valid email'] },
-    phone:    { type: String, required: true, trim: true },
-    password: { type: String, required: true },
-    bio:      { type: String, default: '', trim: true },
-    role:     { type: String, enum: ['Practitioner', 'Business'], default: 'Practitioner' },
+    fullName:     { type: String, required: true, trim: true },
+    email:        { type: String, required: true, unique: true, lowercase: true, trim: true,
+                    match: [/^\S+@\S+\.\S+$/, 'Please enter a valid email'] },
+    phone:        { type: String, required: true, trim: true },
+    password:     { type: String, required: true },
+    bio:          { type: String, default: '', trim: true },
+    role:         { type: String, enum: ['Practitioner', 'Business'], default: 'Practitioner' },
     profilePhoto: { type: String, default: null },
   },
   { timestamps: true }
@@ -87,39 +112,38 @@ const User = mongoose.model('User', userSchema);
 
 const jobSchema = new mongoose.Schema(
   {
-    title:           { type: String, required: true, trim: true },
-    company:         { type: String, required: true, trim: true },
-    location:        { type: String, required: true },
-    salary:          { type: String, required: true },
-    jobType:         { type: String, required: true },
-    workingPlaceType:{ type: String, default: 'Hybrid' },
-    description:     { type: String, default: '' },
-    requirements:    [{ label: String, value: String }],
-    schedule:        [{ label: String, value: String }],
-    rate:            { type: String, default: '' },
-    distance:        { type: String, default: '' },
-    maxClients:      { type: Number, default: null },
-    coverTime:       { type: String, default: '' },
-    postedBy:        { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    title:            { type: String, required: true, trim: true },
+    company:          { type: String, required: true, trim: true },
+    location:         { type: String, required: true },
+    salary:           { type: String, required: true },
+    jobType:          { type: String, required: true },
+    workingPlaceType: { type: String, default: 'Hybrid' },
+    description:      { type: String, default: '' },
+    requirements:     [{ label: String, value: String }],
+    schedule:         [{ label: String, value: String }],
+    rate:             { type: String, default: '' },
+    distance:         { type: String, default: '' },
+    maxClients:       { type: Number, default: null },
+    coverTime:        { type: String, default: '' },
+    postedBy:         { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   },
   { timestamps: true }
 );
 
 const Job = mongoose.model('Job', jobSchema);
 
-// Application schema: documents now store Cloudinary URLs
 const applicationSchema = new mongoose.Schema(
   {
-    job:          { type: mongoose.Schema.Types.ObjectId, ref: 'Job', required: true },
-    applicant:    { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-    fullName:     { type: String, required: true },
-    email:        { type: String, required: true },
-    phone:        { type: String, required: true },
-    coverLetter:  { type: String, default: '' },
-    documents:    [{
+    job:         { type: mongoose.Schema.Types.ObjectId, ref: 'Job', required: true },
+    applicant:   { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    fullName:    { type: String, required: true },
+    email:       { type: String, required: true },
+    phone:       { type: String, required: true },
+    coverLetter: { type: String, default: '' },
+    documents:   [{
       originalName: String,
-      url:          String,   // Cloudinary secure URL
-      publicId:     String,   // optional for management
+      url:          String,  // Cloudinary secure URL
+      publicId:     String,  // for management/deletion
     }],
   },
   { timestamps: true }
@@ -127,41 +151,46 @@ const applicationSchema = new mongoose.Schema(
 
 const Application = mongoose.model('Application', applicationSchema);
 
-// ── Helper: upload a buffer to Cloudinary ──────────────────────────────────────
+// ── Helper: upload buffer to Cloudinary ───────────────────────────────────────
 const uploadToCloudinary = (buffer, folder, resource_type = 'auto') => {
   return new Promise((resolve, reject) => {
-    const uploadStream = cloudinary.uploader.upload_stream(
+    const stream = cloudinary.uploader.upload_stream(
       { folder, resource_type },
-      (error, result) => {
-        if (error) reject(error);
-        else resolve(result);
-      }
+      (error, result) => (error ? reject(error) : resolve(result))
     );
-    uploadStream.end(buffer);
+    stream.end(buffer);
   });
 };
-
-// ══════════════════════════════════════════════════════════════════════════════
-//  ROUTES
-// ══════════════════════════════════════════════════════════════════════════════
 
 // ── Authentication middleware ──────────────────────────────────────────────────
 const authenticate = (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    if (!authHeader?.startsWith('Bearer ')) {
       return res.status(401).json({ message: 'No token provided.' });
     }
     const token = authHeader.split(' ')[1];
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = decoded;
+    req.user = jwt.verify(token, process.env.JWT_SECRET);
     next();
-  } catch (err) {
+  } catch {
     return res.status(401).json({ message: 'Invalid or expired token.' });
   }
 };
 
-// ── POST /api/register ────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+//  ROUTES  (all defined after the DB middleware above)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Health check ──────────────────────────────────────────────────────────────
+app.get('/health', (_req, res) => {
+  res.json({
+    status: 'ok',
+    mongo:  mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+    time:   new Date().toISOString(),
+  });
+});
+
+// ── POST /api/register ─────────────────────────────────────────────────────────
 app.post('/api/register', upload.single('profilePhoto'), async (req, res) => {
   try {
     const { fullName, email, phone, password, bio, role } = req.body;
@@ -174,11 +203,8 @@ app.post('/api/register', upload.single('profilePhoto'), async (req, res) => {
     }
 
     const existing = await User.findOne({ email: email.toLowerCase() });
-    if (existing) {
-      return res.status(409).json({ message: 'An account with this email already exists.' });
-    }
+    if (existing) return res.status(409).json({ message: 'An account with this email already exists.' });
 
-    // Upload profile photo if provided
     let profilePhotoUrl = null;
     if (req.file) {
       const result = await uploadToCloudinary(req.file.buffer, 'profile_photos', 'image');
@@ -186,7 +212,6 @@ app.post('/api/register', upload.single('profilePhoto'), async (req, res) => {
     }
 
     const hashedPassword = await bcrypt.hash(password, 12);
-    console.log(`🔐  Password hashed for: ${email}`);
 
     const user = await User.create({
       fullName,
@@ -204,25 +229,19 @@ app.post('/api/register', upload.single('profilePhoto'), async (req, res) => {
       { expiresIn: '7d' }
     );
 
-    console.log(`👤  New user created → ${user._id} (${user.email})`);
-    return res.status(201).json({
-      message: 'Profile created successfully.',
-      token,
-      userId: user._id,
-      user,
-    });
+    console.log(`👤  New user → ${user._id} (${user.email})`);
+    return res.status(201).json({ message: 'Profile created successfully.', token, userId: user._id, user });
   } catch (err) {
     console.error('Register error:', err.message);
     if (err.code === 11000) return res.status(409).json({ message: 'Email already in use.' });
     if (err.name === 'ValidationError') {
-      const messages = Object.values(err.errors).map(e => e.message);
-      return res.status(400).json({ message: messages.join(' | ') });
+      return res.status(400).json({ message: Object.values(err.errors).map(e => e.message).join(' | ') });
     }
     return res.status(500).json({ message: 'Server error. Please try again.' });
   }
 });
 
-// ── POST /api/login ───────────────────────────────────────────────────────────
+// ── POST /api/login ────────────────────────────────────────────────────────────
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -241,18 +260,14 @@ app.post('/api/login', async (req, res) => {
     );
 
     console.log(`🔓  User logged in → ${user.email}`);
-    res.status(200).json({
-      message: 'Login successful',
-      token,
-      user: user.toJSON(),
-    });
+    res.json({ message: 'Login successful', token, user: user.toJSON() });
   } catch (err) {
     console.error('Login error:', err);
     res.status(500).json({ message: 'Server error. Please try again.' });
   }
 });
 
-// ── GET /api/profile – protected ─────────────────────────────────────────────
+// ── GET /api/profile (protected) ──────────────────────────────────────────────
 app.get('/api/profile', authenticate, async (req, res) => {
   try {
     const user = await User.findById(req.user.userId);
@@ -263,7 +278,7 @@ app.get('/api/profile', authenticate, async (req, res) => {
   }
 });
 
-// ── Job Routes (unchanged except they use authenticate) ──────────────────────
+// ── GET /api/jobs ──────────────────────────────────────────────────────────────
 app.get('/api/jobs', async (_req, res) => {
   try {
     const jobs = await Job.find().sort({ createdAt: -1 }).populate('postedBy', 'fullName email');
@@ -273,6 +288,7 @@ app.get('/api/jobs', async (_req, res) => {
   }
 });
 
+// ── GET /api/jobs/:id ──────────────────────────────────────────────────────────
 app.get('/api/jobs/:id', async (req, res) => {
   try {
     const job = await Job.findById(req.params.id).populate('postedBy', 'fullName email');
@@ -283,6 +299,7 @@ app.get('/api/jobs/:id', async (req, res) => {
   }
 });
 
+// ── POST /api/jobs ─────────────────────────────────────────────────────────────
 app.post('/api/jobs', authenticate, async (req, res) => {
   try {
     if (req.user.role !== 'Business') {
@@ -304,19 +321,16 @@ app.post('/api/jobs', authenticate, async (req, res) => {
   } catch (err) {
     console.error('Job creation error:', err);
     if (err.name === 'ValidationError') {
-      const messages = Object.values(err.errors).map(e => e.message);
-      return res.status(400).json({ message: messages.join(' | ') });
+      return res.status(400).json({ message: Object.values(err.errors).map(e => e.message).join(' | ') });
     }
     res.status(500).json({ message: 'Server error. Please try again.' });
   }
 });
 
-// ── POST /api/jobs/:id/apply – file upload via Cloudinary ─────────────────────
+// ── POST /api/jobs/:id/apply ───────────────────────────────────────────────────
 app.post('/api/jobs/:id/apply', authenticate, (req, res) => {
   uploadAppDocs(req, res, async (err) => {
-    if (err) {
-      return res.status(400).json({ message: err.message });
-    }
+    if (err) return res.status(400).json({ message: err.message });
 
     try {
       const job = await Job.findById(req.params.id);
@@ -327,30 +341,23 @@ app.post('/api/jobs/:id/apply', authenticate, (req, res) => {
         return res.status(400).json({ message: 'fullName, email, and phone are required.' });
       }
 
-      // Upload all attached documents to Cloudinary
       const documents = [];
-      if (req.files && req.files.length > 0) {
+      if (req.files?.length) {
         for (const file of req.files) {
           const result = await uploadToCloudinary(file.buffer, 'application_documents');
-          documents.push({
-            originalName: file.originalname,
-            url: result.secure_url,
-            publicId: result.public_id,
-          });
+          documents.push({ originalName: file.originalname, url: result.secure_url, publicId: result.public_id });
         }
       }
 
       const application = await Application.create({
         job: job._id,
         applicant: req.user.userId,
-        fullName,
-        email,
-        phone,
+        fullName, email, phone,
         coverLetter: coverLetter || '',
         documents,
       });
 
-      console.log(`📨  New application for job "${job.title}" by ${email}`);
+      console.log(`📨  New application for "${job.title}" by ${email}`);
       res.status(201).json({ message: 'Application submitted successfully.', application });
     } catch (error) {
       console.error('Apply error:', error);
@@ -359,7 +366,7 @@ app.post('/api/jobs/:id/apply', authenticate, (req, res) => {
   });
 });
 
-// ── GET /api/applications/me ─────────────────────────────────────────────────
+// ── GET /api/applications/me ───────────────────────────────────────────────────
 app.get('/api/applications/me', authenticate, async (req, res) => {
   try {
     const applications = await Application.find({ applicant: req.user.userId })
@@ -371,7 +378,7 @@ app.get('/api/applications/me', authenticate, async (req, res) => {
   }
 });
 
-// ── Public user routes ────────────────────────────────────────────────────────
+// ── GET /api/users ─────────────────────────────────────────────────────────────
 app.get('/api/users', async (_req, res) => {
   try {
     const users = await User.find().sort({ createdAt: -1 });
@@ -381,6 +388,7 @@ app.get('/api/users', async (_req, res) => {
   }
 });
 
+// ── GET /api/users/:id ─────────────────────────────────────────────────────────
 app.get('/api/users/:id', async (req, res) => {
   try {
     const user = await User.findById(req.params.id);
@@ -391,19 +399,10 @@ app.get('/api/users/:id', async (req, res) => {
   }
 });
 
-// Health check
-app.get('/health', (_req, res) => {
-  res.json({
-    status: 'ok',
-    mongo: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
-    time: new Date().toISOString(),
-  });
-});
-
-// ── Error Handlers ────────────────────────────────────────────────────────────
+// ── Error Handlers ─────────────────────────────────────────────────────────────
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) return res.status(400).json({ message: `Upload error: ${err.message}` });
-  if (err.message && err.message.startsWith('Only ')) return res.status(400).json({ message: err.message });
+  if (err.message?.startsWith('Only '))  return res.status(400).json({ message: err.message });
   next(err);
 });
 app.use((err, req, res, next) => {
@@ -418,36 +417,12 @@ app.use((err, req, res, _next) => {
   res.status(500).json({ message: 'Internal server error.' });
 });
 
-// ── MongoDB connection & Vercel serverless export ─────────────────────────────
-let cachedDb = null;
-
-async function connectToDatabase() {
-  if (cachedDb && mongoose.connection.readyState === 1) {
-    return cachedDb;
-  }
-  await mongoose.connect(MONGO_URI);
-  cachedDb = mongoose.connection;
-  console.log('✅ MongoDB connected');
-  return cachedDb;
-}
-
-// Connect to DB before handling any request (Vercel cold start)
-app.use(async (req, res, next) => {
-  try {
-    await connectToDatabase();
-    next();
-  } catch (err) {
-    console.error('MongoDB connection error:', err);
-    res.status(500).json({ message: 'Database connection failed' });
-  }
-});
-
-// For local development you can still listen on a port
+// ── Local dev server ───────────────────────────────────────────────────────────
 if (process.env.NODE_ENV !== 'production') {
   const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => {
-    console.log(`🚀 Local server running on port ${PORT}`);
+  connectToDatabase().then(() => {
+    app.listen(PORT, () => console.log(`🚀 Local server on port ${PORT}`));
   });
 }
 
-module.exports = app;   // Vercel expects the Express app to be exported
+module.exports = app; // Vercel expects the Express app exported
