@@ -15,6 +15,35 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ── MongoDB connection (Vercel serverless-safe) ────────────────────────────────
+// IMPORTANT: this must run BEFORE any route handler touches the database,
+// otherwise queries fire before Mongoose finishes connecting and time out
+// with "buffering timed out after 10000ms" on cold serverless invocations.
+const MONGO_URI = process.env.MONGO_URI;
+if (!MONGO_URI) {
+  console.error('❌ MONGO_URI is not set');
+  process.exit(1);
+}
+
+let cachedDb = null;
+async function connectToDatabase() {
+  if (cachedDb && mongoose.connection.readyState === 1) return cachedDb;
+  await mongoose.connect(MONGO_URI);
+  cachedDb = mongoose.connection;
+  console.log('✅ MongoDB connected');
+  return cachedDb;
+}
+
+app.use(async (req, res, next) => {
+  try {
+    await connectToDatabase();
+    next();
+  } catch (err) {
+    console.error('MongoDB connection error:', err);
+    res.status(500).json({ message: 'Database connection failed' });
+  }
+});
+
 // ── Check JWT secret ───────────────────────────────────────────────────────────
 if (!process.env.JWT_SECRET) {
   console.error('❌  JWT_SECRET is not defined in .env file');
@@ -59,13 +88,6 @@ const uploadChatFile = multer({
   limits:     { fileSize: 100 * 1024 * 1024 },
   fileFilter: (_req, _file, cb) => cb(null, true),   // accept all files
 }).single('file');
-
-// ── MongoDB Connection ─────────────────────────────────────────────────────────
-const MONGO_URI = process.env.MONGO_URI;
-if (!MONGO_URI) {
-  console.error('❌ MONGO_URI is not set');
-  process.exit(1);
-}
 
 // ── Schemas ────────────────────────────────────────────────────────────────────
 const userSchema = new mongoose.Schema(
@@ -467,7 +489,7 @@ app.get('/api/contacts', authenticate, async (req, res) => {
 //  CHAT ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
-// GET /api/conversations – list user’s conversations
+// GET /api/conversations – list user's conversations
 app.get('/api/conversations', authenticate, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -692,27 +714,6 @@ app.use((req, res) => {
 app.use((err, req, res, _next) => {
   console.error('Unhandled error:', err);
   res.status(500).json({ message: 'Internal server error.' });
-});
-
-// ── MongoDB connection (Vercel serverless-safe) ───────────────────────────────
-let cachedDb = null;
-async function connectToDatabase() {
-  if (cachedDb && mongoose.connection.readyState === 1) return cachedDb;
-  await mongoose.connect(MONGO_URI);
-  cachedDb = mongoose.connection;
-  console.log('✅ MongoDB connected');
-  return cachedDb;
-}
-
-
-app.use(async (req, res, next) => {
-  try {
-    await connectToDatabase();
-    next();
-  } catch (err) {
-    console.error('MongoDB connection error:', err);
-    res.status(500).json({ message: 'Database connection failed' });
-  }
 });
 
 if (process.env.NODE_ENV !== 'production') {
