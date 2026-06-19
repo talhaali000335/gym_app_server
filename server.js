@@ -28,21 +28,23 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// ── Multer – memory storage (no disk writes) ───────────────────────────────────
+// ── Multer – memory storage ────────────────────────────────────────────────────
 const memoryStorage = multer.memoryStorage();
 
+// For profile photos (images only, 5 MB)
 const upload = multer({
-  storage:   memoryStorage,
-  limits:    { fileSize: 5 * 1024 * 1024 },
+  storage:    memoryStorage,
+  limits:     { fileSize: 5 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const isImage = /\.(jpe?g|png|gif|webp)$/i.test(file.originalname);
     isImage ? cb(null, true) : cb(new Error('Only image files (jpg, png, gif, webp) are allowed.'));
   },
 });
 
+// For application documents (PDF, images, 10 MB)
 const uploadAppDocs = multer({
-  storage:   memoryStorage,
-  limits:    { fileSize: 10 * 1024 * 1024 },
+  storage:    memoryStorage,
+  limits:     { fileSize: 10 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const allowed = /\.(pdf|jpe?g|png|gif|webp)$/i;
     allowed.test(path.extname(file.originalname))
@@ -50,6 +52,13 @@ const uploadAppDocs = multer({
       : cb(new Error('Only PDF and image files (jpg, png, gif, webp) are allowed.'));
   },
 }).array('documents', 5);
+
+// For chat attachments (any file type, 100 MB)
+const uploadChatFile = multer({
+  storage:    memoryStorage,
+  limits:     { fileSize: 100 * 1024 * 1024 },
+  fileFilter: (_req, _file, cb) => cb(null, true),   // accept all files
+}).single('file');
 
 // ── MongoDB Connection ─────────────────────────────────────────────────────────
 const MONGO_URI = process.env.MONGO_URI;
@@ -123,7 +132,56 @@ const applicationSchema = new mongoose.Schema(
 
 const Application = mongoose.model('Application', applicationSchema);
 
-// ── Helper: upload a buffer to Cloudinary ──────────────────────────────────────
+// ── Conversation & Message Schemas (Chat) ────────────────────────────────────
+const conversationSchema = new mongoose.Schema(
+  {
+    participants: [{
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
+    }],
+    lastMessage: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Message',
+      default: null,
+    },
+  },
+  { timestamps: true }
+);
+conversationSchema.index({ participants: 1 });
+const Conversation = mongoose.model('Conversation', conversationSchema);
+
+const messageSchema = new mongoose.Schema(
+  {
+    conversation: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Conversation',
+      required: true,
+    },
+    sender: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
+    },
+    messageType: {
+      type: String,
+      enum: ['text', 'image', 'video', 'file'],
+      default: 'text',
+    },
+    content:    { type: String, default: '' },       // text or file URL
+    fileName:   { type: String, default: null },
+    fileSize:   { type: Number, default: null },
+    readBy: [{
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+    }],
+  },
+  { timestamps: true }
+);
+messageSchema.index({ conversation: 1, createdAt: -1 });
+const Message = mongoose.model('Message', messageSchema);
+
+// ── Helper: upload buffer to Cloudinary ──────────────────────────────────────
 const uploadToCloudinary = (buffer, folder, resource_type = 'auto') =>
   new Promise((resolve, reject) => {
     const uploadStream = cloudinary.uploader.upload_stream(
@@ -132,6 +190,13 @@ const uploadToCloudinary = (buffer, folder, resource_type = 'auto') =>
     );
     uploadStream.end(buffer);
   });
+
+// ── Helper: determine message type from MIME ─────────────────────────────────
+const getMessageType = (mimetype) => {
+  if (mimetype.startsWith('image/')) return 'image';
+  if (mimetype.startsWith('video/')) return 'video';
+  return 'file';
+};
 
 // ── Authentication middleware ──────────────────────────────────────────────────
 const authenticate = (req, res, next) => {
@@ -237,13 +302,6 @@ app.get('/api/profile', authenticate, async (req, res) => {
 //  JOB ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
-// ── GET /api/jobs  (paginated) ────────────────────────────────────────────────
-// Query params:
-//   page  – page number, 1-based  (default: 1)
-//   limit – items per page        (default: 10, max: 50)
-//
-// Response shape:
-//   { jobs, currentPage, totalPages, totalCount, hasMore }
 app.get('/api/jobs', async (req, res) => {
   try {
     const page  = Math.max(1, parseInt(req.query.page)  || 1);
@@ -273,7 +331,6 @@ app.get('/api/jobs', async (req, res) => {
   }
 });
 
-// ── GET /api/jobs/:id ─────────────────────────────────────────────────────────
 app.get('/api/jobs/:id', async (req, res) => {
   try {
     const job = await Job.findById(req.params.id).populate('postedBy', 'fullName email');
@@ -284,7 +341,6 @@ app.get('/api/jobs/:id', async (req, res) => {
   }
 });
 
-// ── POST /api/jobs ────────────────────────────────────────────────────────────
 app.post('/api/jobs', authenticate, async (req, res) => {
   try {
     if (req.user.role !== 'Business')
@@ -314,7 +370,6 @@ app.post('/api/jobs', authenticate, async (req, res) => {
   }
 });
 
-// ── POST /api/jobs/:id/apply ──────────────────────────────────────────────────
 app.post('/api/jobs/:id/apply', authenticate, (req, res) => {
   uploadAppDocs(req, res, async (err) => {
     if (err) return res.status(400).json({ message: err.message });
@@ -355,7 +410,6 @@ app.post('/api/jobs/:id/apply', authenticate, (req, res) => {
   });
 });
 
-// ── GET /api/applications/me ──────────────────────────────────────────────────
 app.get('/api/applications/me', authenticate, async (req, res) => {
   try {
     const applications = await Application.find({ applicant: req.user.userId })
@@ -367,7 +421,10 @@ app.get('/api/applications/me', authenticate, async (req, res) => {
   }
 });
 
-// ── User routes ───────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+//  USER ROUTES
+// ══════════════════════════════════════════════════════════════════════════════
+
 app.get('/api/users', async (_req, res) => {
   try {
     const users = await User.find().sort({ createdAt: -1 });
@@ -387,7 +444,255 @@ app.get('/api/users/:id', async (req, res) => {
   }
 });
 
-// ── Health check ──────────────────────────────────────────────────────────────
+// ── NEW: Contact list (only users you are allowed to chat with) ──────────────
+app.get('/api/contacts', authenticate, async (req, res) => {
+  try {
+    const currentUserId = req.user.userId;
+    const currentUser = await User.findById(currentUserId);
+    if (!currentUser) return res.status(404).json({ message: 'User not found' });
+
+    // Rule: Practitioner → Businesses they've applied to jobs for
+    //       Business → Practitioners who applied to their jobs
+    if (currentUser.role === 'Practitioner') {
+      const applications = await Application.find({ applicant: currentUserId })
+        .select('job')
+        .lean();
+      const jobIds = applications.map(app => app.job);
+      const jobs = await Job.find({ _id: { $in: jobIds } })
+        .select('postedBy')
+        .lean();
+      const businessIds = [...new Set(jobs.map(job => job.postedBy.toString()))];
+      
+      const contacts = await User.find({ _id: { $in: businessIds } })
+        .select('fullName profilePhoto role')
+        .sort({ fullName: 1 });
+      return res.json({ contacts });
+    }
+
+    if (currentUser.role === 'Business') {
+      const jobs = await Job.find({ postedBy: currentUserId }).select('_id').lean();
+      const jobIds = jobs.map(job => job._id);
+      const applications = await Application.find({ job: { $in: jobIds } })
+        .select('applicant')
+        .lean();
+      const practitionerIds = [...new Set(applications.map(app => app.applicant.toString()))];
+      
+      const contacts = await User.find({ _id: { $in: practitionerIds } })
+        .select('fullName profilePhoto role')
+        .sort({ fullName: 1 });
+      return res.json({ contacts });
+    }
+
+    // Fallback: no contacts
+    return res.json({ contacts: [] });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  CHAT ROUTES
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/conversations – list user’s conversations
+app.get('/api/conversations', authenticate, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+
+    const conversations = await Conversation.find({
+      participants: userId,
+    })
+      .populate('participants', 'fullName profilePhoto')
+      .populate('lastMessage')
+      .sort({ updatedAt: -1 });
+
+    const enriched = await Promise.all(
+      conversations.map(async (conv) => {
+        const unreadCount = await Message.countDocuments({
+          conversation: conv._id,
+          readBy: { $ne: userId },
+          sender: { $ne: userId },
+        });
+        const otherParticipant = conv.participants.find(
+          (p) => p._id.toString() !== userId.toString()
+        );
+        return {
+          _id: conv._id,
+          otherUser: otherParticipant,
+          lastMessage: conv.lastMessage,
+          unreadCount,
+          updatedAt: conv.updatedAt,
+        };
+      })
+    );
+
+    res.json({ conversations: enriched });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// POST /api/conversations – create or return existing (now with validation)
+app.post('/api/conversations', authenticate, async (req, res) => {
+  try {
+    const { otherUserId } = req.body;
+    if (!otherUserId) return res.status(400).json({ message: 'otherUserId required' });
+
+    const userId = req.user.userId;
+    if (userId === otherUserId)
+      return res.status(400).json({ message: 'Cannot start conversation with yourself' });
+
+    // ── Validate that the two users are allowed to chat ─────────────────────
+    const currentUser = await User.findById(userId);
+    const otherUser = await User.findById(otherUserId);
+    if (!currentUser || !otherUser) return res.status(404).json({ message: 'User not found' });
+
+    let allowed = false;
+    if (currentUser.role === 'Practitioner' && otherUser.role === 'Business') {
+      // Practitioner must have applied to at least one job of this Business
+      const application = await Application.findOne({ applicant: userId })
+        .populate('job');
+      if (application && application.job && application.job.postedBy.toString() === otherUserId) {
+        allowed = true;
+      }
+    } else if (currentUser.role === 'Business' && otherUser.role === 'Practitioner') {
+      // Business must have a job that this Practitioner applied to
+      const job = await Job.findOne({ postedBy: userId });
+      if (job) {
+        const application = await Application.findOne({ applicant: otherUserId, job: job._id });
+        if (application) allowed = true;
+      }
+    }
+
+    if (!allowed) {
+      return res.status(403).json({ message: 'You are not allowed to chat with this user' });
+    }
+
+    // ── Create / return conversation ────────────────────────────────────────
+    let conversation = await Conversation.findOne({
+      participants: { $all: [userId, otherUserId] },
+    }).populate('participants', 'fullName profilePhoto');
+
+    if (conversation) {
+      return res.json({ conversation });
+    }
+
+    conversation = await Conversation.create({
+      participants: [userId, otherUserId],
+    });
+    await conversation.populate('participants', 'fullName profilePhoto');
+
+    res.status(201).json({ conversation });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// GET /api/conversations/:id/messages – paginated (with `after` polling support)
+app.get('/api/conversations/:id/messages', authenticate, async (req, res) => {
+  try {
+    const conversationId = req.params.id;
+    const { page = 1, limit = 30, after } = req.query;
+
+    const filter = { conversation: conversationId };
+    if (after) {
+      filter.createdAt = { $gt: new Date(after) };
+    }
+
+    const skip = (Math.max(1, parseInt(page)) - 1) * parseInt(limit);
+    const messages = await Message.find(filter)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit))
+      .populate('sender', 'fullName profilePhoto');
+
+    const total = await Message.countDocuments({ conversation: conversationId });
+
+    res.json({
+      messages: messages.reverse(),   // newest last
+      currentPage: parseInt(page),
+      totalPages: Math.ceil(total / parseInt(limit)),
+      totalCount: total,
+      hasMore: skip + messages.length < total,
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// POST /api/conversations/:id/messages – send text or file
+app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
+  uploadChatFile(req, res, async (err) => {
+    if (err) {
+      if (err instanceof multer.MulterError)
+        return res.status(400).json({ message: `Upload error: ${err.message}` });
+      return res.status(400).json({ message: err.message });
+    }
+
+    try {
+      const conversation = await Conversation.findById(req.params.id);
+      if (!conversation) return res.status(404).json({ message: 'Conversation not found' });
+
+      if (!conversation.participants.includes(req.user.userId))
+        return res.status(403).json({ message: 'Not a participant' });
+
+      let messageData = {
+        conversation: conversation._id,
+        sender: req.user.userId,
+        readBy: [req.user.userId],
+      };
+
+      if (req.body.text && !req.file) {
+        messageData.messageType = 'text';
+        messageData.content = req.body.text;
+      } else if (req.file) {
+        const result = await uploadToCloudinary(req.file.buffer, 'chat_files', 'auto');
+        messageData.messageType = getMessageType(req.file.mimetype);
+        messageData.content = result.secure_url;
+        messageData.fileName = req.file.originalname;
+        messageData.fileSize = req.file.size;
+      } else {
+        return res.status(400).json({ message: 'Text or file is required' });
+      }
+
+      const message = await Message.create(messageData);
+      await message.populate('sender', 'fullName profilePhoto');
+
+      conversation.lastMessage = message._id;
+      await conversation.save();
+
+      res.status(201).json({ message });
+    } catch (error) {
+      console.error('Send message error:', error);
+      res.status(500).json({ message: 'Server error' });
+    }
+  });
+});
+
+// PATCH /api/conversations/:id/read – mark messages as read
+app.patch('/api/conversations/:id/read', authenticate, async (req, res) => {
+  try {
+    const conversationId = req.params.id;
+    const userId = req.user.userId;
+
+    await Message.updateMany(
+      {
+        conversation: conversationId,
+        readBy: { $ne: userId },
+      },
+      { $addToSet: { readBy: userId } }
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  HEALTH CHECK & ERROR HANDLING
+// ══════════════════════════════════════════════════════════════════════════════
+
 app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
@@ -396,7 +701,6 @@ app.get('/health', (_req, res) => {
   });
 });
 
-// ── Error Handlers ────────────────────────────────────────────────────────────
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError)
     return res.status(400).json({ message: `Upload error: ${err.message}` });
@@ -419,7 +723,6 @@ app.use((err, req, res, _next) => {
 
 // ── MongoDB connection (Vercel serverless-safe) ───────────────────────────────
 let cachedDb = null;
-
 async function connectToDatabase() {
   if (cachedDb && mongoose.connection.readyState === 1) return cachedDb;
   await mongoose.connect(MONGO_URI);
