@@ -444,47 +444,20 @@ app.get('/api/users/:id', async (req, res) => {
   }
 });
 
-// ── NEW: Contact list (only users you are allowed to chat with) ──────────────
+// ── TEMPORARY CONTACT LIST (all opposite-role users) ───────────────────────
+// Replace this block with the original secure version once chat testing is done.
 app.get('/api/contacts', authenticate, async (req, res) => {
   try {
-    const currentUserId = req.user.userId;
-    const currentUser = await User.findById(currentUserId);
+    const currentUser = await User.findById(req.user.userId);
     if (!currentUser) return res.status(404).json({ message: 'User not found' });
 
-    // Rule: Practitioner → Businesses they've applied to jobs for
-    //       Business → Practitioners who applied to their jobs
-    if (currentUser.role === 'Practitioner') {
-      const applications = await Application.find({ applicant: currentUserId })
-        .select('job')
-        .lean();
-      const jobIds = applications.map(app => app.job);
-      const jobs = await Job.find({ _id: { $in: jobIds } })
-        .select('postedBy')
-        .lean();
-      const businessIds = [...new Set(jobs.map(job => job.postedBy.toString()))];
-      
-      const contacts = await User.find({ _id: { $in: businessIds } })
-        .select('fullName profilePhoto role')
-        .sort({ fullName: 1 });
-      return res.json({ contacts });
-    }
+    const oppositeRole = currentUser.role === 'Practitioner' ? 'Business' : 'Practitioner';
 
-    if (currentUser.role === 'Business') {
-      const jobs = await Job.find({ postedBy: currentUserId }).select('_id').lean();
-      const jobIds = jobs.map(job => job._id);
-      const applications = await Application.find({ job: { $in: jobIds } })
-        .select('applicant')
-        .lean();
-      const practitionerIds = [...new Set(applications.map(app => app.applicant.toString()))];
-      
-      const contacts = await User.find({ _id: { $in: practitionerIds } })
-        .select('fullName profilePhoto role')
-        .sort({ fullName: 1 });
-      return res.json({ contacts });
-    }
+    const contacts = await User.find({ role: oppositeRole })
+      .select('fullName profilePhoto role')
+      .sort({ fullName: 1 });
 
-    // Fallback: no contacts
-    return res.json({ contacts: [] });
+    res.json({ contacts });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
