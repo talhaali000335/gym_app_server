@@ -704,6 +704,7 @@ async function connectToDatabase() {
   return cachedDb;
 }
 
+
 app.use(async (req, res, next) => {
   try {
     await connectToDatabase();
