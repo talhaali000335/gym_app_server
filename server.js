@@ -79,14 +79,46 @@ if (!MONGO_URI) {
 // exactly what "Operation `users.findOne()` buffering timed out after
 // 10000ms" means: Mongoose was never actually connected.
 let connectionPromise = null;
+
+// If Mongoose itself notices the connection drop (common on serverless,
+// where a container can be frozen between requests and the socket dies
+// while frozen), throw away the stale cached promise so the NEXT request
+// actually reconnects instead of trusting a connection that's no longer
+// alive. Without this, a request can "successfully" await an old resolved
+// promise, get waved through to the route handler, and then sit there
+// buffering against a dead socket for 10 seconds.
+mongoose.connection.on('disconnected', () => {
+  console.warn('⚠️  MongoDB disconnected — will reconnect on next request');
+  connectionPromise = null;
+});
+mongoose.connection.on('error', (err) => {
+  console.error('❌ Mongoose connection error:', err.message);
+  connectionPromise = null;
+});
+
 async function connectToDatabase() {
   if (mongoose.connection.readyState === 1) return mongoose.connection;
-  if (!connectionPromise) {
-    connectionPromise = mongoose.connect(MONGO_URI).catch((err) => {
+
+  // readyState 2 = "currently connecting" — safe to just wait on the
+  // in-flight attempt rather than starting a second one.
+  if (mongoose.connection.readyState === 2 && connectionPromise) {
+    await connectionPromise;
+    return mongoose.connection;
+  }
+
+  connectionPromise = mongoose
+    .connect(MONGO_URI, {
+      // Fail fast with the REAL error (bad credentials, IP not whitelisted,
+      // paused cluster, etc.) well before Mongoose's own 10s query-buffering
+      // timeout fires and masks it with a generic "buffering timed out" message.
+      serverSelectionTimeoutMS: 5000,
+    })
+    .catch((err) => {
       connectionPromise = null; // let the next request retry instead of being stuck forever
+      console.error('❌ MongoDB connection failed:', err.message);
       throw err;
     });
-  }
+
   await connectionPromise;
   return mongoose.connection;
 }
