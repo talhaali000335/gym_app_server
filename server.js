@@ -15,35 +15,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ── MongoDB connection (Vercel serverless-safe) ────────────────────────────────
-// IMPORTANT: this must run BEFORE any route handler touches the database,
-// otherwise queries fire before Mongoose finishes connecting and time out
-// with "buffering timed out after 10000ms" on cold serverless invocations.
-const MONGO_URI = process.env.MONGO_URI;
-if (!MONGO_URI) {
-  console.error('❌ MONGO_URI is not set');
-  process.exit(1);
-}
-
-let cachedDb = null;
-async function connectToDatabase() {
-  if (cachedDb && mongoose.connection.readyState === 1) return cachedDb;
-  await mongoose.connect(MONGO_URI);
-  cachedDb = mongoose.connection;
-  console.log('✅ MongoDB connected');
-  return cachedDb;
-}
-
-app.use(async (req, res, next) => {
-  try {
-    await connectToDatabase();
-    next();
-  } catch (err) {
-    console.error('MongoDB connection error:', err);
-    res.status(500).json({ message: 'Database connection failed' });
-  }
-});
-
 // ── Check JWT secret ───────────────────────────────────────────────────────────
 if (!process.env.JWT_SECRET) {
   console.error('❌  JWT_SECRET is not defined in .env file');
@@ -82,12 +53,23 @@ const uploadAppDocs = multer({
   },
 }).array('documents', 5);
 
-// For chat attachments (any file type, 100 MB)
+// For chat attachments sent through our own server (small files / legacy path).
+// NOTE: large attachments (photos, voice notes) now go straight to Cloudinary
+// from the client — see /api/cloudinary/signature below — because Vercel
+// serverless functions hard-cap the request body at 4.5MB. This route stays
+// in place for backwards compatibility and for small files.
 const uploadChatFile = multer({
   storage:    memoryStorage,
   limits:     { fileSize: 100 * 1024 * 1024 },
   fileFilter: (_req, _file, cb) => cb(null, true),   // accept all files
 }).single('file');
+
+// ── MongoDB Connection ─────────────────────────────────────────────────────────
+const MONGO_URI = process.env.MONGO_URI;
+if (!MONGO_URI) {
+  console.error('❌ MONGO_URI is not set');
+  process.exit(1);
+}
 
 // ── Schemas ────────────────────────────────────────────────────────────────────
 const userSchema = new mongoose.Schema(
@@ -185,14 +167,17 @@ const messageSchema = new mongoose.Schema(
       ref: 'User',
       required: true,
     },
-   messageType: {
-  type: String,
-  enum: ['text', 'image', 'video', 'audio', 'file'],
-  default: 'text',
-     },
-    content:    { type: String, default: '' },       // text or file URL
-    fileName:   { type: String, default: null },
-    fileSize:   { type: Number, default: null },
+    messageType: {
+      type: String,
+      enum: ['text', 'image', 'video', 'audio', 'file', 'location'],
+      default: 'text',
+    },
+    content:      { type: String, default: '' },     // text, file URL, or location label
+    fileName:     { type: String, default: null },
+    fileSize:     { type: Number, default: null },
+    latitude:     { type: Number, default: null },    // used when messageType === 'location'
+    longitude:    { type: Number, default: null },
+    locationName: { type: String, default: null },
     readBy: [{
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
@@ -214,7 +199,6 @@ const uploadToCloudinary = (buffer, folder, resource_type = 'auto') =>
   });
 
 // ── Helper: determine message type from MIME ─────────────────────────────────
-// getMessageType — add an audio check
 const getMessageType = (mimetype) => {
   if (mimetype.startsWith('image/')) return 'image';
   if (mimetype.startsWith('video/')) return 'video';
@@ -236,6 +220,12 @@ const authenticate = (req, res, next) => {
     return res.status(401).json({ message: 'Invalid or expired token.' });
   }
 };
+
+// Helper: is this user actually a participant of this conversation?
+// (Compares as strings — comparing raw ObjectId instances with Array.includes
+// is unreliable since it uses strict equality, not Mongoose's .equals()).
+const isParticipant = (conversation, userId) =>
+  conversation.participants.map(String).includes(String(userId));
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  AUTH ROUTES
@@ -491,7 +481,7 @@ app.get('/api/contacts', authenticate, async (req, res) => {
 //  CHAT ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
-// GET /api/conversations – list user's conversations
+// GET /api/conversations – list user’s conversations
 app.get('/api/conversations', authenticate, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -617,7 +607,7 @@ app.get('/api/conversations/:id/messages', authenticate, async (req, res) => {
   }
 });
 
-// POST /api/conversations/:id/messages – send text or file
+// POST /api/conversations/:id/messages – send text, or a small file through our own server
 app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
   uploadChatFile(req, res, async (err) => {
     if (err) {
@@ -630,7 +620,7 @@ app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
       const conversation = await Conversation.findById(req.params.id);
       if (!conversation) return res.status(404).json({ message: 'Conversation not found' });
 
-      if (!conversation.participants.includes(req.user.userId))
+      if (!isParticipant(conversation, req.user.userId))
         return res.status(403).json({ message: 'Not a participant' });
 
       let messageData = {
@@ -664,6 +654,123 @@ app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
       res.status(500).json({ message: 'Server error' });
     }
   });
+});
+
+// ── Direct-to-Cloudinary upload support ──────────────────────────────────────
+// Vercel serverless functions hard-cap the request body at 4.5MB and this
+// cannot be raised in config — it's an infrastructure limit. So instead of
+// uploading the file bytes through this server, the client:
+//   1) calls GET /api/cloudinary/signature to get a short-lived signed upload
+//      credential
+//   2) uploads the file directly to Cloudinary's API with that credential
+//      (never touches this server)
+//   3) calls POST /api/conversations/:id/messages/attachment with the
+//      resulting URL — a tiny JSON payload
+
+// GET /api/cloudinary/signature?folder=chat_files
+app.get('/api/cloudinary/signature', authenticate, (req, res) => {
+  try {
+    const folder = req.query.folder || 'chat_files';
+    const timestamp = Math.round(Date.now() / 1000);
+
+    const signature = cloudinary.utils.api_sign_request(
+      { timestamp, folder },
+      process.env.CLOUDINARY_API_SECRET
+    );
+
+    res.json({
+      signature,
+      timestamp,
+      apiKey: process.env.CLOUDINARY_API_KEY,
+      cloudName: process.env.CLOUDINARY_CLOUD_NAME,
+      folder,
+    });
+  } catch (err) {
+    console.error('Cloudinary signature error:', err);
+    res.status(500).json({ message: 'Could not create upload signature' });
+  }
+});
+
+// POST /api/conversations/:id/messages/attachment
+// Body (JSON, tiny): { url, fileName, fileSize, resourceType }
+app.post('/api/conversations/:id/messages/attachment', authenticate, async (req, res) => {
+  try {
+    const conversation = await Conversation.findById(req.params.id);
+    if (!conversation) return res.status(404).json({ message: 'Conversation not found' });
+
+    if (!isParticipant(conversation, req.user.userId))
+      return res.status(403).json({ message: 'Not a participant' });
+
+    const { url, fileName, fileSize, resourceType } = req.body;
+    if (!url) return res.status(400).json({ message: 'url is required' });
+
+    let messageType = 'file';
+    if (resourceType === 'image') messageType = 'image';
+    else if (resourceType === 'audio') messageType = 'audio';
+    else if (resourceType === 'video') messageType = 'video';
+
+    const message = await Message.create({
+      conversation: conversation._id,
+      sender: req.user.userId,
+      readBy: [req.user.userId],
+      messageType,
+      content: url,
+      fileName: fileName || null,
+      fileSize: fileSize || null,
+    });
+    await message.populate('sender', 'fullName profilePhoto');
+
+    conversation.lastMessage = message._id;
+    await conversation.save();
+
+    res.status(201).json({ message });
+  } catch (error) {
+    console.error('Attachment message error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// POST /api/conversations/:id/messages/location
+// Body: { latitude, longitude, locationName? }
+app.post('/api/conversations/:id/messages/location', authenticate, async (req, res) => {
+  try {
+    const conversation = await Conversation.findById(req.params.id);
+    if (!conversation) return res.status(404).json({ message: 'Conversation not found' });
+
+    if (!isParticipant(conversation, req.user.userId))
+      return res.status(403).json({ message: 'Not a participant' });
+
+    const { latitude, longitude, locationName } = req.body;
+    if (latitude === undefined || latitude === null || longitude === undefined || longitude === null)
+      return res.status(400).json({ message: 'latitude and longitude are required' });
+
+    const lat = Number(latitude);
+    const lng = Number(longitude);
+    if (Number.isNaN(lat) || Number.isNaN(lng))
+      return res.status(400).json({ message: 'latitude and longitude must be numbers' });
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180)
+      return res.status(400).json({ message: 'latitude/longitude out of range' });
+
+    const message = await Message.create({
+      conversation: conversation._id,
+      sender: req.user.userId,
+      readBy: [req.user.userId],
+      messageType: 'location',
+      content: locationName || `${lat}, ${lng}`,
+      latitude: lat,
+      longitude: lng,
+      locationName: locationName || null,
+    });
+    await message.populate('sender', 'fullName profilePhoto');
+
+    conversation.lastMessage = message._id;
+    await conversation.save();
+
+    res.status(201).json({ message });
+  } catch (error) {
+    console.error('Location message error:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
 });
 
 // PATCH /api/conversations/:id/read – mark messages as read
@@ -716,6 +823,26 @@ app.use((req, res) => {
 app.use((err, req, res, _next) => {
   console.error('Unhandled error:', err);
   res.status(500).json({ message: 'Internal server error.' });
+});
+
+// ── MongoDB connection (Vercel serverless-safe) ───────────────────────────────
+let cachedDb = null;
+async function connectToDatabase() {
+  if (cachedDb && mongoose.connection.readyState === 1) return cachedDb;
+  await mongoose.connect(MONGO_URI);
+  cachedDb = mongoose.connection;
+  console.log('✅ MongoDB connected');
+  return cachedDb;
+}
+
+app.use(async (req, res, next) => {
+  try {
+    await connectToDatabase();
+    next();
+  } catch (err) {
+    console.error('MongoDB connection error:', err);
+    res.status(500).json({ message: 'Database connection failed' });
+  }
 });
 
 if (process.env.NODE_ENV !== 'production') {
