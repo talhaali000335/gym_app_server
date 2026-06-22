@@ -71,6 +71,36 @@ if (!MONGO_URI) {
   process.exit(1);
 }
 
+// IMPORTANT: this middleware must be registered before any route below.
+// Express runs middleware/routes strictly in registration order — if this
+// were registered after the routes (as it was before), it would never run
+// for a matched request, and every DB query would just sit in Mongoose's
+// buffer until it hit the default 10-second buffering timeout. That's
+// exactly what "Operation `users.findOne()` buffering timed out after
+// 10000ms" means: Mongoose was never actually connected.
+let connectionPromise = null;
+async function connectToDatabase() {
+  if (mongoose.connection.readyState === 1) return mongoose.connection;
+  if (!connectionPromise) {
+    connectionPromise = mongoose.connect(MONGO_URI).catch((err) => {
+      connectionPromise = null; // let the next request retry instead of being stuck forever
+      throw err;
+    });
+  }
+  await connectionPromise;
+  return mongoose.connection;
+}
+
+app.use(async (req, res, next) => {
+  try {
+    await connectToDatabase();
+    next();
+  } catch (err) {
+    console.error('MongoDB connection error:', err);
+    res.status(500).json({ message: 'Database connection failed' });
+  }
+});
+
 // ── Schemas ────────────────────────────────────────────────────────────────────
 const userSchema = new mongoose.Schema(
   {
@@ -825,25 +855,12 @@ app.use((err, req, res, _next) => {
   res.status(500).json({ message: 'Internal server error.' });
 });
 
-// ── MongoDB connection (Vercel serverless-safe) ───────────────────────────────
-let cachedDb = null;
-async function connectToDatabase() {
-  if (cachedDb && mongoose.connection.readyState === 1) return cachedDb;
-  await mongoose.connect(MONGO_URI);
-  cachedDb = mongoose.connection;
-  console.log('✅ MongoDB connected');
-  return cachedDb;
-}
-
-app.use(async (req, res, next) => {
-  try {
-    await connectToDatabase();
-    next();
-  } catch (err) {
-    console.error('MongoDB connection error:', err);
-    res.status(500).json({ message: 'Database connection failed' });
-  }
-});
+// ── MongoDB connection is established near the top of this file, before any
+// route is registered (see "MongoDB Connection" section above). It must run
+// there, not here — Express matches routes in registration order, so a
+// middleware registered after every route never actually runs for a matched
+// request, which is exactly what caused queries to sit in Mongoose's buffer
+// until they timed out.
 
 if (process.env.NODE_ENV !== 'production') {
   const PORT = process.env.PORT || 3000;
