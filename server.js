@@ -185,11 +185,11 @@ const messageSchema = new mongoose.Schema(
       ref: 'User',
       required: true,
     },
-    messageType: {
-      type: String,
-      enum: ['text', 'image', 'video', 'file'],
-      default: 'text',
-    },
+   messageType: {
+  type: String,
+  enum: ['text', 'image', 'video', 'audio', 'file'],
+  default: 'text',
+     },
     content:    { type: String, default: '' },       // text or file URL
     fileName:   { type: String, default: null },
     fileSize:   { type: Number, default: null },
@@ -214,9 +214,11 @@ const uploadToCloudinary = (buffer, folder, resource_type = 'auto') =>
   });
 
 // ── Helper: determine message type from MIME ─────────────────────────────────
+// getMessageType — add an audio check
 const getMessageType = (mimetype) => {
   if (mimetype.startsWith('image/')) return 'image';
   if (mimetype.startsWith('video/')) return 'video';
+  if (mimetype.startsWith('audio/')) return 'audio';
   return 'file';
 };
 
