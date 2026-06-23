@@ -61,8 +61,30 @@ const uploadAppDocs = multer({
 const uploadChatFile = multer({
   storage:    memoryStorage,
   limits:     { fileSize: 100 * 1024 * 1024 },
-  fileFilter: (_req, _file, cb) => cb(null, true),   // accept all files
+  fileFilter: (_req, _file, cb) => cb(null, true), // accept all files
 }).single('file');
+
+// For qualification documents (PDF or images, 10 MB)
+const uploadQualification = multer({
+  storage:    memoryStorage,
+  limits:     { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const allowed = /\.(pdf|jpe?g|png)$/i;
+    allowed.test(path.extname(file.originalname))
+      ? cb(null, true)
+      : cb(new Error('Only PDF and images allowed for qualifications'));
+  },
+}).single('document');
+
+// For portfolio images (multiple, images only, 5 MB each)
+const uploadPortfolio = multer({
+  storage:    memoryStorage,
+  limits:     { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const isImage = /\.(jpe?g|png|gif|webp)$/i.test(file.originalname);
+    isImage ? cb(null, true) : cb(new Error('Only image files allowed'));
+  },
+}).array('images', 10);
 
 // ── MongoDB Connection ─────────────────────────────────────────────────────────
 const MONGO_URI = process.env.MONGO_URI;
@@ -134,16 +156,54 @@ app.use(async (req, res, next) => {
 });
 
 // ── Schemas ────────────────────────────────────────────────────────────────────
+
+const qualificationSchema = new mongoose.Schema(
+  {
+    certificateName:  { type: String, required: true },
+    issuingBy:        { type: String, required: true },
+    expirationDate:   { type: Date,   required: true },
+    documentUrl:      { type: String, default: '' },
+    documentPublicId: { type: String, default: '' },
+  },
+  { _id: true }
+);
+
+const portfolioImageSchema = new mongoose.Schema(
+  {
+    url:      { type: String, required: true },
+    publicId: { type: String, required: true },
+  },
+  { _id: true }
+);
+
 const userSchema = new mongoose.Schema(
   {
     fullName:     { type: String, required: true, trim: true },
-    email:        { type: String, required: true, unique: true, lowercase: true, trim: true,
-                    match: [/^\S+@\S+\.\S+$/, 'Please enter a valid email'] },
+    email:        {
+      type: String, required: true, unique: true,
+      lowercase: true, trim: true,
+      match: [/^\S+@\S+\.\S+$/, 'Please enter a valid email'],
+    },
     phone:        { type: String, required: true, trim: true },
     password:     { type: String, required: true },
     bio:          { type: String, default: '', trim: true },
     role:         { type: String, enum: ['Practitioner', 'Business'], default: 'Practitioner' },
     profilePhoto: { type: String, default: null },
+
+    // Profile setup fields
+    location:    { type: String, default: '' },
+    coordinates: {
+      latitude:  { type: Number, default: null },
+      longitude: { type: Number, default: null },
+    },
+    qualifications:   [qualificationSchema],
+    portfolioImages:  [portfolioImageSchema],
+    verificationSettings: {
+      expiryReminder:    { type: Boolean, default: true },
+      emailReminders:    { type: Boolean, default: true },
+      pushNotifications: { type: Boolean, default: false },
+      remindDaysBefore:  { type: Number,  default: 15 },
+    },
   },
   { timestamps: true }
 );
@@ -198,17 +258,17 @@ const applicationSchema = new mongoose.Schema(
 
 const Application = mongoose.model('Application', applicationSchema);
 
-// ── Conversation & Message Schemas (Chat) ────────────────────────────────────
+// ── Conversation & Message Schemas (Chat) ─────────────────────────────────────
 const conversationSchema = new mongoose.Schema(
   {
     participants: [{
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
+      type:     mongoose.Schema.Types.ObjectId,
+      ref:      'User',
       required: true,
     }],
     lastMessage: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'Message',
+      type:    mongoose.Schema.Types.ObjectId,
+      ref:     'Message',
       default: null,
     },
   },
@@ -220,29 +280,29 @@ const Conversation = mongoose.model('Conversation', conversationSchema);
 const messageSchema = new mongoose.Schema(
   {
     conversation: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'Conversation',
+      type:     mongoose.Schema.Types.ObjectId,
+      ref:      'Conversation',
       required: true,
     },
     sender: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
+      type:     mongoose.Schema.Types.ObjectId,
+      ref:      'User',
       required: true,
     },
     messageType: {
-      type: String,
-      enum: ['text', 'image', 'video', 'audio', 'file', 'location'],
+      type:    String,
+      enum:    ['text', 'image', 'video', 'audio', 'file', 'location'],
       default: 'text',
     },
-    content:      { type: String, default: '' },     // text, file URL, or location label
+    content:      { type: String, default: '' },   // text, file URL, or location label
     fileName:     { type: String, default: null },
     fileSize:     { type: Number, default: null },
-    latitude:     { type: Number, default: null },    // used when messageType === 'location'
+    latitude:     { type: Number, default: null }, // used when messageType === 'location'
     longitude:    { type: Number, default: null },
     locationName: { type: String, default: null },
     readBy: [{
       type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
+      ref:  'User',
     }],
   },
   { timestamps: true }
@@ -250,7 +310,7 @@ const messageSchema = new mongoose.Schema(
 messageSchema.index({ conversation: 1, createdAt: -1 });
 const Message = mongoose.model('Message', messageSchema);
 
-// ── Helper: upload buffer to Cloudinary ──────────────────────────────────────
+// ── Helper: upload buffer to Cloudinary ───────────────────────────────────────
 const uploadToCloudinary = (buffer, folder, resource_type = 'auto') =>
   new Promise((resolve, reject) => {
     const uploadStream = cloudinary.uploader.upload_stream(
@@ -260,7 +320,7 @@ const uploadToCloudinary = (buffer, folder, resource_type = 'auto') =>
     uploadStream.end(buffer);
   });
 
-// ── Helper: determine message type from MIME ─────────────────────────────────
+// ── Helper: determine message type from MIME ──────────────────────────────────
 const getMessageType = (mimetype) => {
   if (mimetype.startsWith('image/')) return 'image';
   if (mimetype.startsWith('video/')) return 'video';
@@ -315,8 +375,8 @@ app.post('/api/register', upload.single('profilePhoto'), async (req, res) => {
     const user = await User.create({
       fullName, email, phone,
       password: hashedPassword,
-      bio: bio || '',
-      role: role || 'Practitioner',
+      bio:      bio  || '',
+      role:     role || 'Practitioner',
       profilePhoto: profilePhotoUrl,
     });
 
@@ -330,7 +390,7 @@ app.post('/api/register', upload.single('profilePhoto'), async (req, res) => {
     return res.status(201).json({ message: 'Profile created successfully.', token, userId: user._id, user });
   } catch (err) {
     console.error('Register error:', err.message);
-    if (err.code === 11000)     return res.status(409).json({ message: 'Email already in use.' });
+    if (err.code === 11000) return res.status(409).json({ message: 'Email already in use.' });
     if (err.name === 'ValidationError') {
       const messages = Object.values(err.errors).map(e => e.message);
       return res.status(400).json({ message: messages.join(' | ') });
@@ -369,6 +429,146 @@ app.get('/api/profile', authenticate, async (req, res) => {
     const user = await User.findById(req.user.userId);
     if (!user) return res.status(404).json({ message: 'User not found.' });
     res.json(user);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  PROFILE SETUP ROUTES
+// ══════════════════════════════════════════════════════════════════════════════
+
+// PUT /api/profile/location – update user's location and optional coordinates
+app.put('/api/profile/location', authenticate, async (req, res) => {
+  try {
+    const { location, latitude, longitude } = req.body;
+    const update = { location: location || '' };
+    if (latitude != null && longitude != null) {
+      update.coordinates = {
+        latitude:  Number(latitude),
+        longitude: Number(longitude),
+      };
+    }
+    const user = await User.findByIdAndUpdate(req.user.userId, update, { new: true });
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+    res.json({ message: 'Location updated', user });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// POST /api/profile/qualifications – add a qualification with optional document upload
+app.post('/api/profile/qualifications', authenticate, (req, res) => {
+  uploadQualification(req, res, async (err) => {
+    if (err) return res.status(400).json({ message: err.message });
+
+    try {
+      const { certificateName, issuingBy, expirationDate } = req.body;
+      if (!certificateName || !issuingBy || !expirationDate)
+        return res.status(400).json({ message: 'certificateName, issuingBy, and expirationDate are required.' });
+
+      let documentUrl      = '';
+      let documentPublicId = '';
+      if (req.file) {
+        const result     = await uploadToCloudinary(req.file.buffer, 'qualifications');
+        documentUrl      = result.secure_url;
+        documentPublicId = result.public_id;
+      }
+
+      const qualification = {
+        certificateName,
+        issuingBy,
+        expirationDate:   new Date(expirationDate),
+        documentUrl,
+        documentPublicId,
+      };
+
+      const user = await User.findByIdAndUpdate(
+        req.user.userId,
+        { $push: { qualifications: qualification } },
+        { new: true }
+      );
+      if (!user) return res.status(404).json({ message: 'User not found.' });
+      res.status(201).json({ message: 'Qualification added', user });
+    } catch (error) {
+      console.error('Add qualification error:', error);
+      res.status(500).json({ message: 'Server error.' });
+    }
+  });
+});
+
+// DELETE /api/profile/qualifications/:qualId – remove a specific qualification
+app.delete('/api/profile/qualifications/:qualId', authenticate, async (req, res) => {
+  try {
+    const user = await User.findByIdAndUpdate(
+      req.user.userId,
+      { $pull: { qualifications: { _id: req.params.qualId } } },
+      { new: true }
+    );
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+    res.json({ message: 'Qualification removed', user });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// POST /api/profile/portfolio – upload one or more portfolio images
+app.post('/api/profile/portfolio', authenticate, (req, res) => {
+  uploadPortfolio(req, res, async (err) => {
+    if (err) return res.status(400).json({ message: err.message });
+
+    try {
+      if (!req.files || req.files.length === 0)
+        return res.status(400).json({ message: 'At least one image is required.' });
+
+      const images = [];
+      for (const file of req.files) {
+        const result = await uploadToCloudinary(file.buffer, 'portfolio', 'image');
+        images.push({ url: result.secure_url, publicId: result.public_id });
+      }
+
+      const user = await User.findByIdAndUpdate(
+        req.user.userId,
+        { $push: { portfolioImages: { $each: images } } },
+        { new: true }
+      );
+      if (!user) return res.status(404).json({ message: 'User not found.' });
+      res.status(201).json({ message: 'Portfolio images added', user });
+    } catch (error) {
+      console.error('Add portfolio error:', error);
+      res.status(500).json({ message: 'Server error.' });
+    }
+  });
+});
+
+// DELETE /api/profile/portfolio/:imageId – remove a specific portfolio image
+app.delete('/api/profile/portfolio/:imageId', authenticate, async (req, res) => {
+  try {
+    const user = await User.findByIdAndUpdate(
+      req.user.userId,
+      { $pull: { portfolioImages: { _id: req.params.imageId } } },
+      { new: true }
+    );
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+    res.json({ message: 'Portfolio image removed', user });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// PUT /api/profile/verification – update verification / notification settings
+app.put('/api/profile/verification', authenticate, async (req, res) => {
+  try {
+    const { expiryReminder, emailReminders, pushNotifications, remindDaysBefore } = req.body;
+    const settings = {};
+    if (expiryReminder    !== undefined) settings['verificationSettings.expiryReminder']    = expiryReminder;
+    if (emailReminders    !== undefined) settings['verificationSettings.emailReminders']    = emailReminders;
+    if (pushNotifications !== undefined) settings['verificationSettings.pushNotifications'] = pushNotifications;
+    if (remindDaysBefore  !== undefined) settings['verificationSettings.remindDaysBefore']  = Number(remindDaysBefore);
+
+    const user = await User.findByIdAndUpdate(req.user.userId, { $set: settings }, { new: true });
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+    res.json({ message: 'Verification settings updated', user });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -520,8 +720,8 @@ app.get('/api/users/:id', async (req, res) => {
   }
 });
 
-// ── TEMPORARY CONTACT LIST (all opposite-role users) ───────────────────────
-// Replace this block with the original secure version once chat testing is done.
+// ── TEMPORARY CONTACT LIST (all opposite-role users) ─────────────────────────
+// Replace with a secure version (application-gated) once chat testing is done.
 app.get('/api/contacts', authenticate, async (req, res) => {
   try {
     const currentUser = await User.findById(req.user.userId);
@@ -543,14 +743,12 @@ app.get('/api/contacts', authenticate, async (req, res) => {
 //  CHAT ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
-// GET /api/conversations – list user’s conversations
+// GET /api/conversations – list user's conversations
 app.get('/api/conversations', authenticate, async (req, res) => {
   try {
     const userId = req.user.userId;
 
-    const conversations = await Conversation.find({
-      participants: userId,
-    })
+    const conversations = await Conversation.find({ participants: userId })
       .populate('participants', 'fullName profilePhoto')
       .populate('lastMessage')
       .sort({ updatedAt: -1 });
@@ -566,11 +764,11 @@ app.get('/api/conversations', authenticate, async (req, res) => {
           (p) => p._id.toString() !== userId.toString()
         );
         return {
-          _id: conv._id,
-          otherUser: otherParticipant,
-          lastMessage: conv.lastMessage,
+          _id:           conv._id,
+          otherUser:     otherParticipant,
+          lastMessage:   conv.lastMessage,
           unreadCount,
-          updatedAt: conv.updatedAt,
+          updatedAt:     conv.updatedAt,
         };
       })
     );
@@ -581,7 +779,7 @@ app.get('/api/conversations', authenticate, async (req, res) => {
   }
 });
 
-// POST /api/conversations – create or return existing (now with validation)
+// POST /api/conversations – create or return existing (with application validation)
 app.post('/api/conversations', authenticate, async (req, res) => {
   try {
     const { otherUserId } = req.body;
@@ -591,16 +789,15 @@ app.post('/api/conversations', authenticate, async (req, res) => {
     if (userId === otherUserId)
       return res.status(400).json({ message: 'Cannot start conversation with yourself' });
 
-    // ── Validate that the two users are allowed to chat ─────────────────────
+    // ── Validate that the two users are allowed to chat ──────────────────────
     const currentUser = await User.findById(userId);
-    const otherUser = await User.findById(otherUserId);
+    const otherUser   = await User.findById(otherUserId);
     if (!currentUser || !otherUser) return res.status(404).json({ message: 'User not found' });
 
     let allowed = false;
     if (currentUser.role === 'Practitioner' && otherUser.role === 'Business') {
       // Practitioner must have applied to at least one job of this Business
-      const application = await Application.findOne({ applicant: userId })
-        .populate('job');
+      const application = await Application.findOne({ applicant: userId }).populate('job');
       if (application && application.job && application.job.postedBy.toString() === otherUserId) {
         allowed = true;
       }
@@ -617,18 +814,14 @@ app.post('/api/conversations', authenticate, async (req, res) => {
       return res.status(403).json({ message: 'You are not allowed to chat with this user' });
     }
 
-    // ── Create / return conversation ────────────────────────────────────────
+    // ── Create / return conversation ─────────────────────────────────────────
     let conversation = await Conversation.findOne({
       participants: { $all: [userId, otherUserId] },
     }).populate('participants', 'fullName profilePhoto');
 
-    if (conversation) {
-      return res.json({ conversation });
-    }
+    if (conversation) return res.json({ conversation });
 
-    conversation = await Conversation.create({
-      participants: [userId, otherUserId],
-    });
+    conversation = await Conversation.create({ participants: [userId, otherUserId] });
     await conversation.populate('participants', 'fullName profilePhoto');
 
     res.status(201).json({ conversation });
@@ -644,11 +837,9 @@ app.get('/api/conversations/:id/messages', authenticate, async (req, res) => {
     const { page = 1, limit = 30, after } = req.query;
 
     const filter = { conversation: conversationId };
-    if (after) {
-      filter.createdAt = { $gt: new Date(after) };
-    }
+    if (after) filter.createdAt = { $gt: new Date(after) };
 
-    const skip = (Math.max(1, parseInt(page)) - 1) * parseInt(limit);
+    const skip     = (Math.max(1, parseInt(page)) - 1) * parseInt(limit);
     const messages = await Message.find(filter)
       .sort({ createdAt: -1 })
       .skip(skip)
@@ -658,18 +849,18 @@ app.get('/api/conversations/:id/messages', authenticate, async (req, res) => {
     const total = await Message.countDocuments({ conversation: conversationId });
 
     res.json({
-      messages: messages.reverse(),   // newest last
+      messages:    messages.reverse(), // newest last
       currentPage: parseInt(page),
-      totalPages: Math.ceil(total / parseInt(limit)),
-      totalCount: total,
-      hasMore: skip + messages.length < total,
+      totalPages:  Math.ceil(total / parseInt(limit)),
+      totalCount:  total,
+      hasMore:     skip + messages.length < total,
     });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-// POST /api/conversations/:id/messages – send text, or a small file through our own server
+// POST /api/conversations/:id/messages – send text or small file through our server
 app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
   uploadChatFile(req, res, async (err) => {
     if (err) {
@@ -687,19 +878,19 @@ app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
 
       let messageData = {
         conversation: conversation._id,
-        sender: req.user.userId,
-        readBy: [req.user.userId],
+        sender:       req.user.userId,
+        readBy:       [req.user.userId],
       };
 
       if (req.body.text && !req.file) {
         messageData.messageType = 'text';
-        messageData.content = req.body.text;
+        messageData.content     = req.body.text;
       } else if (req.file) {
-        const result = await uploadToCloudinary(req.file.buffer, 'chat_files', 'auto');
+        const result            = await uploadToCloudinary(req.file.buffer, 'chat_files', 'auto');
         messageData.messageType = getMessageType(req.file.mimetype);
-        messageData.content = result.secure_url;
-        messageData.fileName = req.file.originalname;
-        messageData.fileSize = req.file.size;
+        messageData.content     = result.secure_url;
+        messageData.fileName    = req.file.originalname;
+        messageData.fileSize    = req.file.size;
       } else {
         return res.status(400).json({ message: 'Text or file is required' });
       }
@@ -718,7 +909,7 @@ app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
   });
 });
 
-// ── Direct-to-Cloudinary upload support ──────────────────────────────────────
+// ── Direct-to-Cloudinary upload support ───────────────────────────────────────
 // Vercel serverless functions hard-cap the request body at 4.5MB and this
 // cannot be raised in config — it's an infrastructure limit. So instead of
 // uploading the file bytes through this server, the client:
@@ -732,7 +923,7 @@ app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
 // GET /api/cloudinary/signature?folder=chat_files
 app.get('/api/cloudinary/signature', authenticate, (req, res) => {
   try {
-    const folder = req.query.folder || 'chat_files';
+    const folder    = req.query.folder || 'chat_files';
     const timestamp = Math.round(Date.now() / 1000);
 
     const signature = cloudinary.utils.api_sign_request(
@@ -743,7 +934,7 @@ app.get('/api/cloudinary/signature', authenticate, (req, res) => {
     res.json({
       signature,
       timestamp,
-      apiKey: process.env.CLOUDINARY_API_KEY,
+      apiKey:    process.env.CLOUDINARY_API_KEY,
       cloudName: process.env.CLOUDINARY_CLOUD_NAME,
       folder,
     });
@@ -773,12 +964,12 @@ app.post('/api/conversations/:id/messages/attachment', authenticate, async (req,
 
     const message = await Message.create({
       conversation: conversation._id,
-      sender: req.user.userId,
-      readBy: [req.user.userId],
+      sender:       req.user.userId,
+      readBy:       [req.user.userId],
       messageType,
-      content: url,
-      fileName: fileName || null,
-      fileSize: fileSize || null,
+      content:      url,
+      fileName:     fileName  || null,
+      fileSize:     fileSize  || null,
     });
     await message.populate('sender', 'fullName profilePhoto');
 
@@ -815,12 +1006,12 @@ app.post('/api/conversations/:id/messages/location', authenticate, async (req, r
 
     const message = await Message.create({
       conversation: conversation._id,
-      sender: req.user.userId,
-      readBy: [req.user.userId],
-      messageType: 'location',
-      content: locationName || `${lat}, ${lng}`,
-      latitude: lat,
-      longitude: lng,
+      sender:       req.user.userId,
+      readBy:       [req.user.userId],
+      messageType:  'location',
+      content:      locationName || `${lat}, ${lng}`,
+      latitude:     lat,
+      longitude:    lng,
       locationName: locationName || null,
     });
     await message.populate('sender', 'fullName profilePhoto');
@@ -835,17 +1026,14 @@ app.post('/api/conversations/:id/messages/location', authenticate, async (req, r
   }
 });
 
-// PATCH /api/conversations/:id/read – mark messages as read
+// PATCH /api/conversations/:id/read – mark all messages in conversation as read
 app.patch('/api/conversations/:id/read', authenticate, async (req, res) => {
   try {
     const conversationId = req.params.id;
-    const userId = req.user.userId;
+    const userId         = req.user.userId;
 
     await Message.updateMany(
-      {
-        conversation: conversationId,
-        readBy: { $ne: userId },
-      },
+      { conversation: conversationId, readBy: { $ne: userId } },
       { $addToSet: { readBy: userId } }
     );
 
@@ -886,13 +1074,6 @@ app.use((err, req, res, _next) => {
   console.error('Unhandled error:', err);
   res.status(500).json({ message: 'Internal server error.' });
 });
-
-// ── MongoDB connection is established near the top of this file, before any
-// route is registered (see "MongoDB Connection" section above). It must run
-// there, not here — Express matches routes in registration order, so a
-// middleware registered after every route never actually runs for a matched
-// request, which is exactly what caused queries to sit in Mongoose's buffer
-// until they timed out.
 
 if (process.env.NODE_ENV !== 'production') {
   const PORT = process.env.PORT || 3000;
