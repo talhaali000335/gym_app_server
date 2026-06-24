@@ -317,6 +317,26 @@ const authenticate = (req, res, next) => {
   }
 };
 
+// ── NEW: Onboarding auth – allows userId in body if no token present ──────────
+const onboardingAuth = async (req, res, next) => {
+  // If already authenticated via JWT, skip
+  if (req.user) return next();
+
+  const userId = req.body.userId;
+  if (!userId) {
+    return res.status(401).json({ message: 'Authentication required. Provide a token or userId.' });
+  }
+
+  try {
+    const user = await User.findById(userId);
+    if (!user) return res.status(401).json({ message: 'Invalid user ID.' });
+    req.user = { userId: user._id, email: user.email, role: user.role };
+    next();
+  } catch (err) {
+    res.status(500).json({ message: 'Server error during authentication.' });
+  }
+};
+
 // Helper: is this user actually a participant of this conversation?
 const isParticipant = (conversation, userId) =>
   conversation.participants.map(String).includes(String(userId));
@@ -352,14 +372,9 @@ app.post('/api/register', upload.single('profilePhoto'), async (req, res) => {
       profilePhoto: profilePhotoUrl,
     });
 
-    const token = jwt.sign(
-      { userId: user._id, email: user.email, role: user.role },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-
+    // ⚠️ NO token generated here – only return userId
     console.log(`👤  New user created → ${user._id} (${user.email})`);
-    return res.status(201).json({ message: 'Profile created successfully.', token, userId: user._id, user });
+    return res.status(201).json({ message: 'Profile created successfully.', userId: user._id, user });
   } catch (err) {
     console.error('Register error:', err.message);
     if (err.code === 11000) return res.status(409).json({ message: 'Email already in use.' });
@@ -368,6 +383,29 @@ app.post('/api/register', upload.single('profilePhoto'), async (req, res) => {
       return res.status(400).json({ message: messages.join(' | ') });
     }
     return res.status(500).json({ message: 'Server error. Please try again.' });
+  }
+});
+
+// ── NEW: Complete registration – issue the final token after verification ─────
+app.post('/api/register/complete', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ message: 'userId is required.' });
+
+    const user = await User.findById(userId);
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+
+    const token = jwt.sign(
+      { userId: user._id, email: user.email, role: user.role },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    console.log(`🔐 Final token issued for user ${user.email}`);
+    res.json({ token, user: user.toJSON() });
+  } catch (err) {
+    console.error('Complete registration error:', err);
+    res.status(500).json({ message: 'Server error.' });
   }
 });
 
@@ -407,63 +445,14 @@ app.get('/api/profile', authenticate, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  ENHANCED: PUT /api/profile – now also accepts profile photo upload
-// ══════════════════════════════════════════════════════════════════════════════
-app.put('/api/profile', authenticate, upload.single('profilePhoto'), async (req, res) => {
-  try {
-    const { fullName, email, phone, bio } = req.body;
-    const update = {};
-
-    if (fullName !== undefined) update.fullName = fullName;
-    if (email !== undefined) {
-      // Check if email is already taken by another user
-      if (email !== req.user.email) {
-        const existing = await User.findOne({ email: email.toLowerCase() });
-        if (existing && existing._id.toString() !== req.user.userId) {
-          return res.status(409).json({ message: 'Email already in use by another account.' });
-        }
-      }
-      update.email = email;
-    }
-    if (phone !== undefined) update.phone = phone;
-    if (bio !== undefined)   update.bio   = bio;
-
-    // Handle profile photo upload
-    if (req.file) {
-      const result = await uploadToCloudinary(req.file.buffer, 'profile_photos', 'image');
-      update.profilePhoto = result.secure_url;
-    }
-
-    if (Object.keys(update).length === 0) {
-      return res.status(400).json({ message: 'No fields to update provided.' });
-    }
-
-    const user = await User.findByIdAndUpdate(
-      req.user.userId,
-      update,
-      { new: true, runValidators: true }
-    );
-
-    if (!user) return res.status(404).json({ message: 'User not found.' });
-    res.json({ message: 'Profile updated', user: user.toJSON() });
-  } catch (err) {
-    console.error('Update profile error:', err);
-    if (err.name === 'ValidationError') {
-      const messages = Object.values(err.errors).map(e => e.message);
-      return res.status(400).json({ message: messages.join(' | ') });
-    }
-    res.status(500).json({ message: 'Server error. Please try again.' });
-  }
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-//  PROFILE SETUP ROUTES (unchanged)
+//  PROFILE SETUP ROUTES (modified to accept userId during onboarding)
 // ══════════════════════════════════════════════════════════════════════════════
 
 // PUT /api/profile/location
-app.put('/api/profile/location', authenticate, async (req, res) => {
+app.put('/api/profile/location', onboardingAuth, async (req, res) => {
   try {
     const { location, latitude, longitude } = req.body;
+    const id = req.user.userId;
     const update = { location: location || '' };
     if (latitude != null && longitude != null) {
       update.coordinates = {
@@ -471,7 +460,7 @@ app.put('/api/profile/location', authenticate, async (req, res) => {
         longitude: Number(longitude),
       };
     }
-    const user = await User.findByIdAndUpdate(req.user.userId, update, { new: true });
+    const user = await User.findByIdAndUpdate(id, update, { new: true });
     if (!user) return res.status(404).json({ message: 'User not found.' });
     res.json({ message: 'Location updated', user });
   } catch (err) {
@@ -480,7 +469,7 @@ app.put('/api/profile/location', authenticate, async (req, res) => {
 });
 
 // POST /api/profile/qualifications
-app.post('/api/profile/qualifications', authenticate, (req, res) => {
+app.post('/api/profile/qualifications', onboardingAuth, (req, res) => {
   uploadQualification(req, res, async (err) => {
     if (err) return res.status(400).json({ message: err.message });
     try {
@@ -534,7 +523,7 @@ app.delete('/api/profile/qualifications/:qualId', authenticate, async (req, res)
 });
 
 // POST /api/profile/portfolio
-app.post('/api/profile/portfolio', authenticate, (req, res) => {
+app.post('/api/profile/portfolio', onboardingAuth, (req, res) => {
   uploadPortfolio(req, res, async (err) => {
     if (err) return res.status(400).json({ message: err.message });
     try {
@@ -577,7 +566,7 @@ app.delete('/api/profile/portfolio/:imageId', authenticate, async (req, res) => 
 });
 
 // PUT /api/profile/verification
-app.put('/api/profile/verification', authenticate, async (req, res) => {
+app.put('/api/profile/verification', onboardingAuth, async (req, res) => {
   try {
     const { expiryReminder, emailReminders, pushNotifications, remindDaysBefore } = req.body;
     const settings = {};
@@ -591,6 +580,47 @@ app.put('/api/profile/verification', authenticate, async (req, res) => {
     res.json({ message: 'Verification settings updated', user });
   } catch (err) {
     res.status(500).json({ message: err.message });
+  }
+});
+
+// PUT /api/profile (update basic fields + photo) – JWT required
+app.put('/api/profile', authenticate, upload.single('profilePhoto'), async (req, res) => {
+  try {
+    const { fullName, email, phone, bio } = req.body;
+    const update = {};
+
+    if (fullName !== undefined) update.fullName = fullName;
+    if (email !== undefined) {
+      if (email !== req.user.email) {
+        const existing = await User.findOne({ email: email.toLowerCase() });
+        if (existing && existing._id.toString() !== req.user.userId) {
+          return res.status(409).json({ message: 'Email already in use by another account.' });
+        }
+      }
+      update.email = email;
+    }
+    if (phone !== undefined) update.phone = phone;
+    if (bio !== undefined)   update.bio   = bio;
+
+    if (req.file) {
+      const result = await uploadToCloudinary(req.file.buffer, 'profile_photos', 'image');
+      update.profilePhoto = result.secure_url;
+    }
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ message: 'No fields to update provided.' });
+    }
+
+    const user = await User.findByIdAndUpdate(req.user.userId, update, { new: true, runValidators: true });
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+    res.json({ message: 'Profile updated', user: user.toJSON() });
+  } catch (err) {
+    console.error('Update profile error:', err);
+    if (err.name === 'ValidationError') {
+      const messages = Object.values(err.errors).map(e => e.message);
+      return res.status(400).json({ message: messages.join(' | ') });
+    }
+    res.status(500).json({ message: 'Server error. Please try again.' });
   }
 });
 
