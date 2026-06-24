@@ -319,10 +319,12 @@ const authenticate = (req, res, next) => {
 
 // ── NEW: Onboarding auth – allows userId in body if no token present ──────────
 const onboardingAuth = async (req, res, next) => {
-  // If already authenticated via JWT, skip
+  // Already authenticated via JWT → skip
   if (req.user) return next();
 
-  const userId = req.body.userId;
+  // 1. Try userId from body (works for JSON requests)
+  // 2. If not found, try the X-User-Id header (for multipart requests)
+  const userId = req.body.userId || req.headers['x-user-id'];
   if (!userId) {
     return res.status(401).json({ message: 'Authentication required. Provide a token or userId.' });
   }
@@ -336,7 +338,6 @@ const onboardingAuth = async (req, res, next) => {
     res.status(500).json({ message: 'Server error during authentication.' });
   }
 };
-
 // Helper: is this user actually a participant of this conversation?
 const isParticipant = (conversation, userId) =>
   conversation.participants.map(String).includes(String(userId));
