@@ -31,7 +31,7 @@ cloudinary.config({
 // ── Multer – memory storage ────────────────────────────────────────────────────
 const memoryStorage = multer.memoryStorage();
 
-// For profile photos (images only, 5 MB)
+// For profile photos (images only, 5 MB) – used in register AND update
 const upload = multer({
   storage:    memoryStorage,
   limits:     { fileSize: 5 * 1024 * 1024 },
@@ -54,14 +54,10 @@ const uploadAppDocs = multer({
 }).array('documents', 5);
 
 // For chat attachments sent through our own server (small files / legacy path).
-// NOTE: large attachments (photos, voice notes) now go straight to Cloudinary
-// from the client — see /api/cloudinary/signature below — because Vercel
-// serverless functions hard-cap the request body at 4.5MB. This route stays
-// in place for backwards compatibility and for small files.
 const uploadChatFile = multer({
   storage:    memoryStorage,
   limits:     { fileSize: 100 * 1024 * 1024 },
-  fileFilter: (_req, _file, cb) => cb(null, true), // accept all files
+  fileFilter: (_req, _file, cb) => cb(null, true),
 }).single('file');
 
 // For qualification documents (PDF or images, 10 MB)
@@ -93,22 +89,8 @@ if (!MONGO_URI) {
   process.exit(1);
 }
 
-// IMPORTANT: this middleware must be registered before any route below.
-// Express runs middleware/routes strictly in registration order — if this
-// were registered after the routes (as it was before), it would never run
-// for a matched request, and every DB query would just sit in Mongoose's
-// buffer until it hit the default 10-second buffering timeout. That's
-// exactly what "Operation `users.findOne()` buffering timed out after
-// 10000ms" means: Mongoose was never actually connected.
 let connectionPromise = null;
 
-// If Mongoose itself notices the connection drop (common on serverless,
-// where a container can be frozen between requests and the socket dies
-// while frozen), throw away the stale cached promise so the NEXT request
-// actually reconnects instead of trusting a connection that's no longer
-// alive. Without this, a request can "successfully" await an old resolved
-// promise, get waved through to the route handler, and then sit there
-// buffering against a dead socket for 10 seconds.
 mongoose.connection.on('disconnected', () => {
   console.warn('⚠️  MongoDB disconnected — will reconnect on next request');
   connectionPromise = null;
@@ -120,27 +102,19 @@ mongoose.connection.on('error', (err) => {
 
 async function connectToDatabase() {
   if (mongoose.connection.readyState === 1) return mongoose.connection;
-
-  // readyState 2 = "currently connecting" — safe to just wait on the
-  // in-flight attempt rather than starting a second one.
   if (mongoose.connection.readyState === 2 && connectionPromise) {
     await connectionPromise;
     return mongoose.connection;
   }
-
   connectionPromise = mongoose
     .connect(MONGO_URI, {
-      // Fail fast with the REAL error (bad credentials, IP not whitelisted,
-      // paused cluster, etc.) well before Mongoose's own 10s query-buffering
-      // timeout fires and masks it with a generic "buffering timed out" message.
       serverSelectionTimeoutMS: 5000,
     })
     .catch((err) => {
-      connectionPromise = null; // let the next request retry instead of being stuck forever
+      connectionPromise = null;
       console.error('❌ MongoDB connection failed:', err.message);
       throw err;
     });
-
   await connectionPromise;
   return mongoose.connection;
 }
@@ -294,10 +268,10 @@ const messageSchema = new mongoose.Schema(
       enum:    ['text', 'image', 'video', 'audio', 'file', 'location'],
       default: 'text',
     },
-    content:      { type: String, default: '' },   // text, file URL, or location label
+    content:      { type: String, default: '' },
     fileName:     { type: String, default: null },
     fileSize:     { type: Number, default: null },
-    latitude:     { type: Number, default: null }, // used when messageType === 'location'
+    latitude:     { type: Number, default: null },
     longitude:    { type: Number, default: null },
     locationName: { type: String, default: null },
     readBy: [{
@@ -344,8 +318,6 @@ const authenticate = (req, res, next) => {
 };
 
 // Helper: is this user actually a participant of this conversation?
-// (Compares as strings — comparing raw ObjectId instances with Array.includes
-// is unreliable since it uses strict equality, not Mongoose's .equals()).
 const isParticipant = (conversation, userId) =>
   conversation.participants.map(String).includes(String(userId));
 
@@ -435,10 +407,60 @@ app.get('/api/profile', authenticate, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  PROFILE SETUP ROUTES
+//  ENHANCED: PUT /api/profile – now also accepts profile photo upload
+// ══════════════════════════════════════════════════════════════════════════════
+app.put('/api/profile', authenticate, upload.single('profilePhoto'), async (req, res) => {
+  try {
+    const { fullName, email, phone, bio } = req.body;
+    const update = {};
+
+    if (fullName !== undefined) update.fullName = fullName;
+    if (email !== undefined) {
+      // Check if email is already taken by another user
+      if (email !== req.user.email) {
+        const existing = await User.findOne({ email: email.toLowerCase() });
+        if (existing && existing._id.toString() !== req.user.userId) {
+          return res.status(409).json({ message: 'Email already in use by another account.' });
+        }
+      }
+      update.email = email;
+    }
+    if (phone !== undefined) update.phone = phone;
+    if (bio !== undefined)   update.bio   = bio;
+
+    // Handle profile photo upload
+    if (req.file) {
+      const result = await uploadToCloudinary(req.file.buffer, 'profile_photos', 'image');
+      update.profilePhoto = result.secure_url;
+    }
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ message: 'No fields to update provided.' });
+    }
+
+    const user = await User.findByIdAndUpdate(
+      req.user.userId,
+      update,
+      { new: true, runValidators: true }
+    );
+
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+    res.json({ message: 'Profile updated', user: user.toJSON() });
+  } catch (err) {
+    console.error('Update profile error:', err);
+    if (err.name === 'ValidationError') {
+      const messages = Object.values(err.errors).map(e => e.message);
+      return res.status(400).json({ message: messages.join(' | ') });
+    }
+    res.status(500).json({ message: 'Server error. Please try again.' });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  PROFILE SETUP ROUTES (unchanged)
 // ══════════════════════════════════════════════════════════════════════════════
 
-// PUT /api/profile/location – update user's location and optional coordinates
+// PUT /api/profile/location
 app.put('/api/profile/location', authenticate, async (req, res) => {
   try {
     const { location, latitude, longitude } = req.body;
@@ -457,11 +479,10 @@ app.put('/api/profile/location', authenticate, async (req, res) => {
   }
 });
 
-// POST /api/profile/qualifications – add a qualification with optional document upload
+// POST /api/profile/qualifications
 app.post('/api/profile/qualifications', authenticate, (req, res) => {
   uploadQualification(req, res, async (err) => {
     if (err) return res.status(400).json({ message: err.message });
-
     try {
       const { certificateName, issuingBy, expirationDate } = req.body;
       if (!certificateName || !issuingBy || !expirationDate)
@@ -497,7 +518,7 @@ app.post('/api/profile/qualifications', authenticate, (req, res) => {
   });
 });
 
-// DELETE /api/profile/qualifications/:qualId – remove a specific qualification
+// DELETE /api/profile/qualifications/:qualId
 app.delete('/api/profile/qualifications/:qualId', authenticate, async (req, res) => {
   try {
     const user = await User.findByIdAndUpdate(
@@ -512,11 +533,10 @@ app.delete('/api/profile/qualifications/:qualId', authenticate, async (req, res)
   }
 });
 
-// POST /api/profile/portfolio – upload one or more portfolio images
+// POST /api/profile/portfolio
 app.post('/api/profile/portfolio', authenticate, (req, res) => {
   uploadPortfolio(req, res, async (err) => {
     if (err) return res.status(400).json({ message: err.message });
-
     try {
       if (!req.files || req.files.length === 0)
         return res.status(400).json({ message: 'At least one image is required.' });
@@ -541,7 +561,7 @@ app.post('/api/profile/portfolio', authenticate, (req, res) => {
   });
 });
 
-// DELETE /api/profile/portfolio/:imageId – remove a specific portfolio image
+// DELETE /api/profile/portfolio/:imageId
 app.delete('/api/profile/portfolio/:imageId', authenticate, async (req, res) => {
   try {
     const user = await User.findByIdAndUpdate(
@@ -556,7 +576,7 @@ app.delete('/api/profile/portfolio/:imageId', authenticate, async (req, res) => 
   }
 });
 
-// PUT /api/profile/verification – update verification / notification settings
+// PUT /api/profile/verification
 app.put('/api/profile/verification', authenticate, async (req, res) => {
   try {
     const { expiryReminder, emailReminders, pushNotifications, remindDaysBefore } = req.body;
@@ -575,7 +595,7 @@ app.put('/api/profile/verification', authenticate, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  JOB ROUTES
+//  JOB ROUTES (unchanged)
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/api/jobs', async (req, res) => {
@@ -649,7 +669,6 @@ app.post('/api/jobs', authenticate, async (req, res) => {
 app.post('/api/jobs/:id/apply', authenticate, (req, res) => {
   uploadAppDocs(req, res, async (err) => {
     if (err) return res.status(400).json({ message: err.message });
-
     try {
       const job = await Job.findById(req.params.id);
       if (!job) return res.status(404).json({ message: 'Job not found.' });
@@ -698,7 +717,7 @@ app.get('/api/applications/me', authenticate, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  USER ROUTES
+//  USER ROUTES (unchanged)
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/api/users', async (_req, res) => {
@@ -720,8 +739,7 @@ app.get('/api/users/:id', async (req, res) => {
   }
 });
 
-// ── TEMPORARY CONTACT LIST (all opposite-role users) ─────────────────────────
-// Replace with a secure version (application-gated) once chat testing is done.
+// ── TEMPORARY CONTACT LIST (unchanged)
 app.get('/api/contacts', authenticate, async (req, res) => {
   try {
     const currentUser = await User.findById(req.user.userId);
@@ -740,14 +758,12 @@ app.get('/api/contacts', authenticate, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  CHAT ROUTES
+//  CHAT ROUTES (unchanged)
 // ══════════════════════════════════════════════════════════════════════════════
 
-// GET /api/conversations – list user's conversations
 app.get('/api/conversations', authenticate, async (req, res) => {
   try {
     const userId = req.user.userId;
-
     const conversations = await Conversation.find({ participants: userId })
       .populate('participants', 'fullName profilePhoto')
       .populate('lastMessage')
@@ -772,84 +788,69 @@ app.get('/api/conversations', authenticate, async (req, res) => {
         };
       })
     );
-
     res.json({ conversations: enriched });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-// POST /api/conversations – create or return existing (with application validation)
 app.post('/api/conversations', authenticate, async (req, res) => {
   try {
     const { otherUserId } = req.body;
     if (!otherUserId) return res.status(400).json({ message: 'otherUserId required' });
-
     const userId = req.user.userId;
     if (userId === otherUserId)
       return res.status(400).json({ message: 'Cannot start conversation with yourself' });
 
-    // ── Validate that the two users are allowed to chat ──────────────────────
     const currentUser = await User.findById(userId);
     const otherUser   = await User.findById(otherUserId);
     if (!currentUser || !otherUser) return res.status(404).json({ message: 'User not found' });
 
     let allowed = false;
     if (currentUser.role === 'Practitioner' && otherUser.role === 'Business') {
-      // Practitioner must have applied to at least one job of this Business
       const application = await Application.findOne({ applicant: userId }).populate('job');
       if (application && application.job && application.job.postedBy.toString() === otherUserId) {
         allowed = true;
       }
     } else if (currentUser.role === 'Business' && otherUser.role === 'Practitioner') {
-      // Business must have a job that this Practitioner applied to
       const job = await Job.findOne({ postedBy: userId });
       if (job) {
         const application = await Application.findOne({ applicant: otherUserId, job: job._id });
         if (application) allowed = true;
       }
     }
-
     if (!allowed) {
       return res.status(403).json({ message: 'You are not allowed to chat with this user' });
     }
 
-    // ── Create / return conversation ─────────────────────────────────────────
     let conversation = await Conversation.findOne({
       participants: { $all: [userId, otherUserId] },
     }).populate('participants', 'fullName profilePhoto');
-
     if (conversation) return res.json({ conversation });
 
     conversation = await Conversation.create({ participants: [userId, otherUserId] });
     await conversation.populate('participants', 'fullName profilePhoto');
-
     res.status(201).json({ conversation });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-// GET /api/conversations/:id/messages – paginated (with `after` polling support)
 app.get('/api/conversations/:id/messages', authenticate, async (req, res) => {
   try {
     const conversationId = req.params.id;
     const { page = 1, limit = 30, after } = req.query;
-
     const filter = { conversation: conversationId };
     if (after) filter.createdAt = { $gt: new Date(after) };
-
     const skip     = (Math.max(1, parseInt(page)) - 1) * parseInt(limit);
     const messages = await Message.find(filter)
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(parseInt(limit))
       .populate('sender', 'fullName profilePhoto');
-
     const total = await Message.countDocuments({ conversation: conversationId });
-
     res.json({
-      messages:    messages.reverse(), // newest last
+      messages:    messages.reverse(),
       currentPage: parseInt(page),
       totalPages:  Math.ceil(total / parseInt(limit)),
       totalCount:  total,
@@ -860,7 +861,6 @@ app.get('/api/conversations/:id/messages', authenticate, async (req, res) => {
   }
 });
 
-// POST /api/conversations/:id/messages – send text or small file through our server
 app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
   uploadChatFile(req, res, async (err) => {
     if (err) {
@@ -868,11 +868,9 @@ app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
         return res.status(400).json({ message: `Upload error: ${err.message}` });
       return res.status(400).json({ message: err.message });
     }
-
     try {
       const conversation = await Conversation.findById(req.params.id);
       if (!conversation) return res.status(404).json({ message: 'Conversation not found' });
-
       if (!isParticipant(conversation, req.user.userId))
         return res.status(403).json({ message: 'Not a participant' });
 
@@ -881,7 +879,6 @@ app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
         sender:       req.user.userId,
         readBy:       [req.user.userId],
       };
-
       if (req.body.text && !req.file) {
         messageData.messageType = 'text';
         messageData.content     = req.body.text;
@@ -894,13 +891,10 @@ app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
       } else {
         return res.status(400).json({ message: 'Text or file is required' });
       }
-
       const message = await Message.create(messageData);
       await message.populate('sender', 'fullName profilePhoto');
-
       conversation.lastMessage = message._id;
       await conversation.save();
-
       res.status(201).json({ message });
     } catch (error) {
       console.error('Send message error:', error);
@@ -909,28 +903,14 @@ app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
   });
 });
 
-// ── Direct-to-Cloudinary upload support ───────────────────────────────────────
-// Vercel serverless functions hard-cap the request body at 4.5MB and this
-// cannot be raised in config — it's an infrastructure limit. So instead of
-// uploading the file bytes through this server, the client:
-//   1) calls GET /api/cloudinary/signature to get a short-lived signed upload
-//      credential
-//   2) uploads the file directly to Cloudinary's API with that credential
-//      (never touches this server)
-//   3) calls POST /api/conversations/:id/messages/attachment with the
-//      resulting URL — a tiny JSON payload
-
-// GET /api/cloudinary/signature?folder=chat_files
 app.get('/api/cloudinary/signature', authenticate, (req, res) => {
   try {
     const folder    = req.query.folder || 'chat_files';
     const timestamp = Math.round(Date.now() / 1000);
-
     const signature = cloudinary.utils.api_sign_request(
       { timestamp, folder },
       process.env.CLOUDINARY_API_SECRET
     );
-
     res.json({
       signature,
       timestamp,
@@ -944,24 +924,18 @@ app.get('/api/cloudinary/signature', authenticate, (req, res) => {
   }
 });
 
-// POST /api/conversations/:id/messages/attachment
-// Body (JSON, tiny): { url, fileName, fileSize, resourceType }
 app.post('/api/conversations/:id/messages/attachment', authenticate, async (req, res) => {
   try {
     const conversation = await Conversation.findById(req.params.id);
     if (!conversation) return res.status(404).json({ message: 'Conversation not found' });
-
     if (!isParticipant(conversation, req.user.userId))
       return res.status(403).json({ message: 'Not a participant' });
-
     const { url, fileName, fileSize, resourceType } = req.body;
     if (!url) return res.status(400).json({ message: 'url is required' });
-
     let messageType = 'file';
     if (resourceType === 'image') messageType = 'image';
     else if (resourceType === 'audio') messageType = 'audio';
     else if (resourceType === 'video') messageType = 'video';
-
     const message = await Message.create({
       conversation: conversation._id,
       sender:       req.user.userId,
@@ -972,10 +946,8 @@ app.post('/api/conversations/:id/messages/attachment', authenticate, async (req,
       fileSize:     fileSize  || null,
     });
     await message.populate('sender', 'fullName profilePhoto');
-
     conversation.lastMessage = message._id;
     await conversation.save();
-
     res.status(201).json({ message });
   } catch (error) {
     console.error('Attachment message error:', error);
@@ -983,27 +955,21 @@ app.post('/api/conversations/:id/messages/attachment', authenticate, async (req,
   }
 });
 
-// POST /api/conversations/:id/messages/location
-// Body: { latitude, longitude, locationName? }
 app.post('/api/conversations/:id/messages/location', authenticate, async (req, res) => {
   try {
     const conversation = await Conversation.findById(req.params.id);
     if (!conversation) return res.status(404).json({ message: 'Conversation not found' });
-
     if (!isParticipant(conversation, req.user.userId))
       return res.status(403).json({ message: 'Not a participant' });
-
     const { latitude, longitude, locationName } = req.body;
     if (latitude === undefined || latitude === null || longitude === undefined || longitude === null)
       return res.status(400).json({ message: 'latitude and longitude are required' });
-
     const lat = Number(latitude);
     const lng = Number(longitude);
     if (Number.isNaN(lat) || Number.isNaN(lng))
       return res.status(400).json({ message: 'latitude and longitude must be numbers' });
     if (lat < -90 || lat > 90 || lng < -180 || lng > 180)
       return res.status(400).json({ message: 'latitude/longitude out of range' });
-
     const message = await Message.create({
       conversation: conversation._id,
       sender:       req.user.userId,
@@ -1015,10 +981,8 @@ app.post('/api/conversations/:id/messages/location', authenticate, async (req, r
       locationName: locationName || null,
     });
     await message.populate('sender', 'fullName profilePhoto');
-
     conversation.lastMessage = message._id;
     await conversation.save();
-
     res.status(201).json({ message });
   } catch (error) {
     console.error('Location message error:', error);
@@ -1026,17 +990,14 @@ app.post('/api/conversations/:id/messages/location', authenticate, async (req, r
   }
 });
 
-// PATCH /api/conversations/:id/read – mark all messages in conversation as read
 app.patch('/api/conversations/:id/read', authenticate, async (req, res) => {
   try {
     const conversationId = req.params.id;
     const userId         = req.user.userId;
-
     await Message.updateMany(
       { conversation: conversationId, readBy: { $ne: userId } },
       { $addToSet: { readBy: userId } }
     );
-
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ message: err.message });
