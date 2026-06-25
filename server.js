@@ -737,11 +737,21 @@ app.post('/api/jobs/:id/apply', authenticate, (req, res) => {
   });
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+//  UPDATED: GET /api/applications/me – now deeply populates job.postedBy
+// ══════════════════════════════════════════════════════════════════════════════
 app.get('/api/applications/me', authenticate, async (req, res) => {
   try {
     const applications = await Application.find({ applicant: req.user.userId })
-      .populate('job')
+      .populate({
+        path: 'job',
+        populate: {
+          path: 'postedBy',
+          select: '_id fullName email',
+        },
+      })
       .sort({ createdAt: -1 });
+
     res.json({ count: applications.length, applications });
   } catch (err) {
     res.status(500).json({ message: err.message });
