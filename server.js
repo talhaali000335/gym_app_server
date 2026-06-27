@@ -3,12 +3,12 @@ require('dotenv').config();
 const express    = require('express');
 const mongoose   = require('mongoose');
 const bcrypt     = require('bcryptjs');
-const jwt        = require('jsonwebtoken'); 
+const jwt        = require('jsonwebtoken');
 const cors       = require('cors');
 const multer     = require('multer');
 const path       = require('path');
 const cloudinary = require('cloudinary').v2;
-const admin      = require('firebase-admin');          // ★ NEW
+const admin      = require('firebase-admin');
 
 const app = express();
 
@@ -23,16 +23,22 @@ if (!process.env.JWT_SECRET) {
 }
 
 // ── Firebase Admin initialisation ─────────────────────────────────────────────
+// ✅ FIX 1 + FIX 2: Parse env JSON and repair Vercel's double-escaped \n in private_key
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
   try {
     const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-    });
+
+    // ✅ CRITICAL for Vercel: repair escaped newlines in the private key
+    serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+
+    if (admin.apps.length === 0) {
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+      });
+    }
     console.log('✅ Firebase Admin SDK initialised');
   } catch (err) {
     console.error('❌ Failed to initialise Firebase Admin:', err.message);
-    // The server continues running – push notifications will simply not work.
   }
 } else {
   console.warn('⚠️  FIREBASE_SERVICE_ACCOUNT not set – push notifications disabled');
@@ -48,7 +54,6 @@ cloudinary.config({
 // ── Multer – memory storage ────────────────────────────────────────────────────
 const memoryStorage = multer.memoryStorage();
 
-// For profile photos (images only, 5 MB) – used in register AND update
 const upload = multer({
   storage:    memoryStorage,
   limits:     { fileSize: 5 * 1024 * 1024 },
@@ -58,7 +63,6 @@ const upload = multer({
   },
 });
 
-// For application documents (PDF, images, 10 MB)
 const uploadAppDocs = multer({
   storage:    memoryStorage,
   limits:     { fileSize: 10 * 1024 * 1024 },
@@ -70,14 +74,12 @@ const uploadAppDocs = multer({
   },
 }).array('documents', 5);
 
-// For chat attachments sent through our own server (small files / legacy path).
 const uploadChatFile = multer({
   storage:    memoryStorage,
   limits:     { fileSize: 100 * 1024 * 1024 },
   fileFilter: (_req, _file, cb) => cb(null, true),
 }).single('file');
 
-// For qualification documents (PDF or images, 10 MB)
 const uploadQualification = multer({
   storage:    memoryStorage,
   limits:     { fileSize: 10 * 1024 * 1024 },
@@ -89,7 +91,6 @@ const uploadQualification = multer({
   },
 }).single('document');
 
-// For portfolio images (multiple, images only, 5 MB each)
 const uploadPortfolio = multer({
   storage:    memoryStorage,
   limits:     { fileSize: 5 * 1024 * 1024 },
@@ -124,9 +125,7 @@ async function connectToDatabase() {
     return mongoose.connection;
   }
   connectionPromise = mongoose
-    .connect(MONGO_URI, {
-      serverSelectionTimeoutMS: 5000,
-    })
+    .connect(MONGO_URI, { serverSelectionTimeoutMS: 5000 })
     .catch((err) => {
       connectionPromise = null;
       console.error('❌ MongoDB connection failed:', err.message);
@@ -180,22 +179,20 @@ const userSchema = new mongoose.Schema(
     bio:          { type: String, default: '', trim: true },
     role:         { type: String, enum: ['Practitioner', 'Business'], default: 'Practitioner' },
     profilePhoto: { type: String, default: null },
-
-    // Profile setup fields
-    location:    { type: String, default: '' },
+    location:     { type: String, default: '' },
     coordinates: {
       latitude:  { type: Number, default: null },
       longitude: { type: Number, default: null },
     },
-    qualifications:   [qualificationSchema],
-    portfolioImages:  [portfolioImageSchema],
+    qualifications:  [qualificationSchema],
+    portfolioImages: [portfolioImageSchema],
     verificationSettings: {
       expiryReminder:    { type: Boolean, default: true },
       emailReminders:    { type: Boolean, default: true },
       pushNotifications: { type: Boolean, default: false },
       remindDaysBefore:  { type: Number,  default: 15 },
     },
-    fcmToken: { type: String, default: null },   // ★ NEW: FCM token
+    fcmToken: { type: String, default: null },
   },
   { timestamps: true }
 );
@@ -250,7 +247,6 @@ const applicationSchema = new mongoose.Schema(
 
 const Application = mongoose.model('Application', applicationSchema);
 
-// ── Conversation & Message Schemas (Chat) ─────────────────────────────────────
 const conversationSchema = new mongoose.Schema(
   {
     participants: [{
@@ -302,7 +298,8 @@ const messageSchema = new mongoose.Schema(
 messageSchema.index({ conversation: 1, createdAt: -1 });
 const Message = mongoose.model('Message', messageSchema);
 
-// ── Helper: upload buffer to Cloudinary ───────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
 const uploadToCloudinary = (buffer, folder, resource_type = 'auto') =>
   new Promise((resolve, reject) => {
     const uploadStream = cloudinary.uploader.upload_stream(
@@ -312,7 +309,6 @@ const uploadToCloudinary = (buffer, folder, resource_type = 'auto') =>
     uploadStream.end(buffer);
   });
 
-// ── Helper: determine message type from MIME ──────────────────────────────────
 const getMessageType = (mimetype) => {
   if (mimetype.startsWith('image/')) return 'image';
   if (mimetype.startsWith('video/')) return 'video';
@@ -335,18 +331,12 @@ const authenticate = (req, res, next) => {
   }
 };
 
-// ── NEW: Onboarding auth – allows userId in body if no token present ──────────
 const onboardingAuth = async (req, res, next) => {
-  // Already authenticated via JWT → skip
   if (req.user) return next();
-
-  // 1. Try userId from body (works for JSON requests). Use optional chaining for multipart safety.
-  // 2. If not found, try the X-User-Id header (for multipart requests)
   const userId = (req.body?.userId) || req.headers['x-user-id'];
   if (!userId) {
     return res.status(401).json({ message: 'Authentication required. Provide a token or userId.' });
   }
-
   try {
     const user = await User.findById(userId);
     if (!user) return res.status(401).json({ message: 'Invalid user ID.' });
@@ -357,32 +347,55 @@ const onboardingAuth = async (req, res, next) => {
   }
 };
 
-// Helper: is this user actually a participant of this conversation?
 const isParticipant = (conversation, userId) =>
   conversation.participants.map(String).includes(String(userId));
 
-// ★ NEW: Helper to send push notification via Firebase Cloud Messaging
+// ── ✅ FIX 3: sendPushNotification with full Android config ───────────────────
 const sendPushNotification = async (userId, title, body, data = {}) => {
   try {
-    // Only attempt to send if Firebase Admin is initialised
     if (!admin.apps || admin.apps.length === 0) return;
 
-    const user = await User.findById(userId);
+    const user = await User.findById(userId).select('fcmToken');
     if (!user || !user.fcmToken) return;
+
+    // Convert all data values to strings (FCM requirement)
+    const stringData = {};
+    for (const [k, v] of Object.entries(data)) {
+      stringData[k] = String(v);
+    }
 
     const message = {
       token: user.fcmToken,
+
+      // System notification shown when app is killed or background
       notification: { title, body },
-      data: Object.fromEntries(
-        Object.entries(data).map(([k, v]) => [k, String(v)])
-      ), // data payload must be string:string
+
+      // ✅ Android priority — without this Android 9 drops the notification
+      android: {
+        priority: 'high',
+        notification: {
+          channelId: 'covrly_default_channel',   // must match Flutter channel id
+          sound: 'default',
+          priority: 'high',
+          defaultVibrateTimings: true,
+          clickAction: 'FLUTTER_NOTIFICATION_CLICK',
+        },
+      },
+
+      // Data payload for in-app navigation
+      data: {
+        title: String(title),
+        body:  String(body),
+        ...stringData,
+      },
     };
 
-    await admin.messaging().send(message);
-    console.log(`📲 Push notification sent to user ${userId}`);
+    const response = await admin.messaging().send(message);
+    console.log(`📲 Push sent to user ${userId}:`, response);
+    return response;
   } catch (error) {
     console.error('❌ Push notification error:', error.message);
-    // If token is invalid/expired, remove it from the user document
+    // Remove invalid/expired tokens from DB automatically
     if (
       error.code === 'messaging/invalid-registration-token' ||
       error.code === 'messaging/registration-token-not-registered'
@@ -437,7 +450,6 @@ app.post('/api/register', upload.single('profilePhoto'), async (req, res) => {
   }
 });
 
-// ── NEW: Complete registration – issue the final token after verification ─────
 app.post('/api/register/complete', async (req, res) => {
   try {
     const { userId } = req.body;
@@ -495,11 +507,24 @@ app.get('/api/profile', authenticate, async (req, res) => {
   }
 });
 
+// ── FCM token update ───────────────────────────────────────────────────────────
+app.put('/api/users/me/token', authenticate, async (req, res) => {
+  try {
+    const { fcmToken } = req.body;
+    if (!fcmToken) return res.status(400).json({ message: 'fcmToken is required.' });
+
+    await User.findByIdAndUpdate(req.user.userId, { fcmToken });
+    console.log(`📱 FCM token updated for user ${req.user.userId}`);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════════════════════
-//  PROFILE SETUP ROUTES (modified to accept userId during onboarding)
+//  PROFILE SETUP ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
-// PUT /api/profile/location
 app.put('/api/profile/location', onboardingAuth, async (req, res) => {
   try {
     const { location, latitude, longitude } = req.body;
@@ -519,7 +544,6 @@ app.put('/api/profile/location', onboardingAuth, async (req, res) => {
   }
 });
 
-// POST /api/profile/qualifications
 app.post('/api/profile/qualifications', onboardingAuth, (req, res) => {
   uploadQualification(req, res, async (err) => {
     if (err) return res.status(400).json({ message: err.message });
@@ -558,7 +582,6 @@ app.post('/api/profile/qualifications', onboardingAuth, (req, res) => {
   });
 });
 
-// DELETE /api/profile/qualifications/:qualId
 app.delete('/api/profile/qualifications/:qualId', authenticate, async (req, res) => {
   try {
     const user = await User.findByIdAndUpdate(
@@ -573,7 +596,6 @@ app.delete('/api/profile/qualifications/:qualId', authenticate, async (req, res)
   }
 });
 
-// POST /api/profile/portfolio
 app.post('/api/profile/portfolio', onboardingAuth, (req, res) => {
   uploadPortfolio(req, res, async (err) => {
     if (err) return res.status(400).json({ message: err.message });
@@ -601,7 +623,6 @@ app.post('/api/profile/portfolio', onboardingAuth, (req, res) => {
   });
 });
 
-// DELETE /api/profile/portfolio/:imageId
 app.delete('/api/profile/portfolio/:imageId', authenticate, async (req, res) => {
   try {
     const user = await User.findByIdAndUpdate(
@@ -616,7 +637,6 @@ app.delete('/api/profile/portfolio/:imageId', authenticate, async (req, res) => 
   }
 });
 
-// PUT /api/profile/verification
 app.put('/api/profile/verification', onboardingAuth, async (req, res) => {
   try {
     const { expiryReminder, emailReminders, pushNotifications, remindDaysBefore } = req.body;
@@ -634,7 +654,6 @@ app.put('/api/profile/verification', onboardingAuth, async (req, res) => {
   }
 });
 
-// PUT /api/profile (update basic fields + photo) – JWT required
 app.put('/api/profile', authenticate, upload.single('profilePhoto'), async (req, res) => {
   try {
     const { fullName, email, phone, bio } = req.body;
@@ -651,7 +670,7 @@ app.put('/api/profile', authenticate, upload.single('profilePhoto'), async (req,
       update.email = email;
     }
     if (phone !== undefined) update.phone = phone;
-    if (bio !== undefined)   update.bio   = bio;
+    if (bio   !== undefined) update.bio   = bio;
 
     if (req.file) {
       const result = await uploadToCloudinary(req.file.buffer, 'profile_photos', 'image');
@@ -675,20 +694,6 @@ app.put('/api/profile', authenticate, upload.single('profilePhoto'), async (req,
   }
 });
 
-// ★ NEW: FCM token registration
-app.put('/api/users/me/token', authenticate, async (req, res) => {
-  try {
-    const { fcmToken } = req.body;
-    if (!fcmToken) return res.status(400).json({ message: 'fcmToken is required.' });
-
-    await User.findByIdAndUpdate(req.user.userId, { fcmToken });
-    console.log(`📱 FCM token updated for user ${req.user.userId}`);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
-});
-
 // ══════════════════════════════════════════════════════════════════════════════
 //  JOB ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
@@ -708,14 +713,12 @@ app.get('/api/jobs', async (req, res) => {
       Job.countDocuments(),
     ]);
 
-    const totalPages = Math.ceil(totalCount / limit);
-
     res.json({
       jobs,
       currentPage: page,
-      totalPages,
+      totalPages:  Math.ceil(totalCount / limit),
       totalCount,
-      hasMore: page < totalPages,
+      hasMore:     page < Math.ceil(totalCount / limit),
     });
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -761,7 +764,6 @@ app.post('/api/jobs', authenticate, async (req, res) => {
   }
 });
 
-// ★ MODIFIED: Send push notification to job poster when someone applies
 app.post('/api/jobs/:id/apply', authenticate, (req, res) => {
   uploadAppDocs(req, res, async (err) => {
     if (err) return res.status(400).json({ message: err.message });
@@ -794,10 +796,10 @@ app.post('/api/jobs/:id/apply', authenticate, (req, res) => {
 
       console.log(`📨  New application for "${job.title}" by ${email}`);
 
-      // ★ Send push to the job poster
+      // ✅ Push notification to job poster with full android config
       sendPushNotification(
         job.postedBy,
-        'New Application',
+        'New Application Received',
         `${fullName} applied for ${job.title}`,
         { type: 'job_application', jobId: job._id.toString() }
       );
@@ -810,18 +812,12 @@ app.post('/api/jobs/:id/apply', authenticate, (req, res) => {
   });
 });
 
-// ══════════════════════════════════════════════════════════════════════════════
-//  UPDATED: GET /api/applications/me – now deeply populates job.postedBy
-// ══════════════════════════════════════════════════════════════════════════════
 app.get('/api/applications/me', authenticate, async (req, res) => {
   try {
     const applications = await Application.find({ applicant: req.user.userId })
       .populate({
         path: 'job',
-        populate: {
-          path: 'postedBy',
-          select: '_id fullName email',
-        },
+        populate: { path: 'postedBy', select: '_id fullName email' },
       })
       .sort({ createdAt: -1 });
 
@@ -854,14 +850,12 @@ app.get('/api/users/:id', async (req, res) => {
   }
 });
 
-// ── TEMPORARY CONTACT LIST (unchanged)
 app.get('/api/contacts', authenticate, async (req, res) => {
   try {
     const currentUser = await User.findById(req.user.userId);
     if (!currentUser) return res.status(404).json({ message: 'User not found' });
 
     const oppositeRole = currentUser.role === 'Practitioner' ? 'Business' : 'Practitioner';
-
     const contacts = await User.find({ role: oppositeRole })
       .select('fullName profilePhoto role')
       .sort({ fullName: 1 });
@@ -895,11 +889,11 @@ app.get('/api/conversations', authenticate, async (req, res) => {
           (p) => p._id.toString() !== userId.toString()
         );
         return {
-          _id:           conv._id,
-          otherUser:     otherParticipant,
-          lastMessage:   conv.lastMessage,
+          _id:         conv._id,
+          otherUser:   otherParticipant,
+          lastMessage: conv.lastMessage,
           unreadCount,
-          updatedAt:     conv.updatedAt,
+          updatedAt:   conv.updatedAt,
         };
       })
     );
@@ -976,7 +970,6 @@ app.get('/api/conversations/:id/messages', authenticate, async (req, res) => {
   }
 });
 
-// ★ MODIFIED: Send push notification to the other participant(s)
 app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
   uploadChatFile(req, res, async (err) => {
     if (err) {
@@ -995,6 +988,7 @@ app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
         sender:       req.user.userId,
         readBy:       [req.user.userId],
       };
+
       if (req.body.text && !req.file) {
         messageData.messageType = 'text';
         messageData.content     = req.body.text;
@@ -1007,19 +1001,21 @@ app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
       } else {
         return res.status(400).json({ message: 'Text or file is required' });
       }
+
       const message = await Message.create(messageData);
       await message.populate('sender', 'fullName profilePhoto');
       conversation.lastMessage = message._id;
       await conversation.save();
 
-      // ★ Push notification to all participants except the sender
+      // ✅ Push notification to all recipients with full android config
       const recipients = conversation.participants.filter(
         (p) => p.toString() !== req.user.userId.toString()
       );
-      const senderName = (await User.findById(req.user.userId))?.fullName || 'Someone';
+      const sender = await User.findById(req.user.userId).select('fullName');
+      const senderName     = sender?.fullName || 'Someone';
       const notificationBody = req.body.text
-        ? `${senderName}: ${req.body.text}`
-        : `📎 ${senderName} sent an attachment`;
+        ? req.body.text
+        : '📎 Sent an attachment';
 
       for (const recipientId of recipients) {
         sendPushNotification(
@@ -1065,20 +1061,23 @@ app.post('/api/conversations/:id/messages/attachment', authenticate, async (req,
     if (!conversation) return res.status(404).json({ message: 'Conversation not found' });
     if (!isParticipant(conversation, req.user.userId))
       return res.status(403).json({ message: 'Not a participant' });
+
     const { url, fileName, fileSize, resourceType } = req.body;
     if (!url) return res.status(400).json({ message: 'url is required' });
+
     let messageType = 'file';
     if (resourceType === 'image') messageType = 'image';
     else if (resourceType === 'audio') messageType = 'audio';
     else if (resourceType === 'video') messageType = 'video';
+
     const message = await Message.create({
       conversation: conversation._id,
       sender:       req.user.userId,
       readBy:       [req.user.userId],
       messageType,
       content:      url,
-      fileName:     fileName  || null,
-      fileSize:     fileSize  || null,
+      fileName:     fileName || null,
+      fileSize:     fileSize || null,
     });
     await message.populate('sender', 'fullName profilePhoto');
     conversation.lastMessage = message._id;
@@ -1096,15 +1095,18 @@ app.post('/api/conversations/:id/messages/location', authenticate, async (req, r
     if (!conversation) return res.status(404).json({ message: 'Conversation not found' });
     if (!isParticipant(conversation, req.user.userId))
       return res.status(403).json({ message: 'Not a participant' });
+
     const { latitude, longitude, locationName } = req.body;
     if (latitude === undefined || latitude === null || longitude === undefined || longitude === null)
       return res.status(400).json({ message: 'latitude and longitude are required' });
+
     const lat = Number(latitude);
     const lng = Number(longitude);
     if (Number.isNaN(lat) || Number.isNaN(lng))
       return res.status(400).json({ message: 'latitude and longitude must be numbers' });
     if (lat < -90 || lat > 90 || lng < -180 || lng > 180)
       return res.status(400).json({ message: 'latitude/longitude out of range' });
+
     const message = await Message.create({
       conversation: conversation._id,
       sender:       req.user.userId,
@@ -1127,11 +1129,9 @@ app.post('/api/conversations/:id/messages/location', authenticate, async (req, r
 
 app.patch('/api/conversations/:id/read', authenticate, async (req, res) => {
   try {
-    const conversationId = req.params.id;
-    const userId         = req.user.userId;
     await Message.updateMany(
-      { conversation: conversationId, readBy: { $ne: userId } },
-      { $addToSet: { readBy: userId } }
+      { conversation: req.params.id, readBy: { $ne: req.user.userId } },
+      { $addToSet: { readBy: req.user.userId } }
     );
     res.json({ success: true });
   } catch (err) {
@@ -1145,9 +1145,10 @@ app.patch('/api/conversations/:id/read', authenticate, async (req, res) => {
 
 app.get('/health', (_req, res) => {
   res.json({
-    status: 'ok',
-    mongo:  mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
-    time:   new Date().toISOString(),
+    status:   'ok',
+    mongo:    mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+    firebase: admin.apps.length > 0 ? 'initialised' : 'not initialised',
+    time:     new Date().toISOString(),
   });
 });
 
@@ -1171,6 +1172,7 @@ app.use((err, req, res, _next) => {
   res.status(500).json({ message: 'Internal server error.' });
 });
 
+// ── Start server (local only — Vercel uses module.exports) ────────────────────
 if (process.env.NODE_ENV !== 'production') {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => console.log(`🚀 Local server running on port ${PORT}`));
