@@ -8,6 +8,7 @@ const cors       = require('cors');
 const multer     = require('multer');
 const path       = require('path');
 const cloudinary = require('cloudinary').v2;
+const admin      = require('firebase-admin');          // ★ NEW
 
 const app = express();
 
@@ -19,6 +20,22 @@ app.use(express.json());
 if (!process.env.JWT_SECRET) {
   console.error('❌  JWT_SECRET is not defined in .env file');
   process.exit(1);
+}
+
+// ── Firebase Admin initialisation ─────────────────────────────────────────────
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  try {
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+    console.log('✅ Firebase Admin SDK initialised');
+  } catch (err) {
+    console.error('❌ Failed to initialise Firebase Admin:', err.message);
+    // The server continues running – push notifications will simply not work.
+  }
+} else {
+  console.warn('⚠️  FIREBASE_SERVICE_ACCOUNT not set – push notifications disabled');
 }
 
 // ── Cloudinary configuration ───────────────────────────────────────────────────
@@ -178,6 +195,7 @@ const userSchema = new mongoose.Schema(
       pushNotifications: { type: Boolean, default: false },
       remindDaysBefore:  { type: Number,  default: 15 },
     },
+    fcmToken: { type: String, default: null },   // ★ NEW: FCM token
   },
   { timestamps: true }
 );
@@ -343,6 +361,38 @@ const onboardingAuth = async (req, res, next) => {
 const isParticipant = (conversation, userId) =>
   conversation.participants.map(String).includes(String(userId));
 
+// ★ NEW: Helper to send push notification via Firebase Cloud Messaging
+const sendPushNotification = async (userId, title, body, data = {}) => {
+  try {
+    // Only attempt to send if Firebase Admin is initialised
+    if (!admin.apps || admin.apps.length === 0) return;
+
+    const user = await User.findById(userId);
+    if (!user || !user.fcmToken) return;
+
+    const message = {
+      token: user.fcmToken,
+      notification: { title, body },
+      data: Object.fromEntries(
+        Object.entries(data).map(([k, v]) => [k, String(v)])
+      ), // data payload must be string:string
+    };
+
+    await admin.messaging().send(message);
+    console.log(`📲 Push notification sent to user ${userId}`);
+  } catch (error) {
+    console.error('❌ Push notification error:', error.message);
+    // If token is invalid/expired, remove it from the user document
+    if (
+      error.code === 'messaging/invalid-registration-token' ||
+      error.code === 'messaging/registration-token-not-registered'
+    ) {
+      await User.findByIdAndUpdate(userId, { fcmToken: null });
+      console.log(`🗑️  Removed invalid FCM token for user ${userId}`);
+    }
+  }
+};
+
 // ══════════════════════════════════════════════════════════════════════════════
 //  AUTH ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
@@ -374,7 +424,6 @@ app.post('/api/register', upload.single('profilePhoto'), async (req, res) => {
       profilePhoto: profilePhotoUrl,
     });
 
-    // ⚠️ NO token generated here – only return userId
     console.log(`👤  New user created → ${user._id} (${user.email})`);
     return res.status(201).json({ message: 'Profile created successfully.', userId: user._id, user });
   } catch (err) {
@@ -626,8 +675,22 @@ app.put('/api/profile', authenticate, upload.single('profilePhoto'), async (req,
   }
 });
 
+// ★ NEW: FCM token registration
+app.put('/api/users/me/token', authenticate, async (req, res) => {
+  try {
+    const { fcmToken } = req.body;
+    if (!fcmToken) return res.status(400).json({ message: 'fcmToken is required.' });
+
+    await User.findByIdAndUpdate(req.user.userId, { fcmToken });
+    console.log(`📱 FCM token updated for user ${req.user.userId}`);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════════════════════
-//  JOB ROUTES (unchanged)
+//  JOB ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/api/jobs', async (req, res) => {
@@ -698,6 +761,7 @@ app.post('/api/jobs', authenticate, async (req, res) => {
   }
 });
 
+// ★ MODIFIED: Send push notification to job poster when someone applies
 app.post('/api/jobs/:id/apply', authenticate, (req, res) => {
   uploadAppDocs(req, res, async (err) => {
     if (err) return res.status(400).json({ message: err.message });
@@ -729,6 +793,15 @@ app.post('/api/jobs/:id/apply', authenticate, (req, res) => {
       });
 
       console.log(`📨  New application for "${job.title}" by ${email}`);
+
+      // ★ Send push to the job poster
+      sendPushNotification(
+        job.postedBy,
+        'New Application',
+        `${fullName} applied for ${job.title}`,
+        { type: 'job_application', jobId: job._id.toString() }
+      );
+
       res.status(201).json({ message: 'Application submitted successfully.', application });
     } catch (error) {
       console.error('Apply error:', error);
@@ -759,7 +832,7 @@ app.get('/api/applications/me', authenticate, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  USER ROUTES (unchanged)
+//  USER ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/api/users', async (_req, res) => {
@@ -800,7 +873,7 @@ app.get('/api/contacts', authenticate, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  CHAT ROUTES (unchanged)
+//  CHAT ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/api/conversations', authenticate, async (req, res) => {
@@ -903,6 +976,7 @@ app.get('/api/conversations/:id/messages', authenticate, async (req, res) => {
   }
 });
 
+// ★ MODIFIED: Send push notification to the other participant(s)
 app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
   uploadChatFile(req, res, async (err) => {
     if (err) {
@@ -937,6 +1011,25 @@ app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
       await message.populate('sender', 'fullName profilePhoto');
       conversation.lastMessage = message._id;
       await conversation.save();
+
+      // ★ Push notification to all participants except the sender
+      const recipients = conversation.participants.filter(
+        (p) => p.toString() !== req.user.userId.toString()
+      );
+      const senderName = (await User.findById(req.user.userId))?.fullName || 'Someone';
+      const notificationBody = req.body.text
+        ? `${senderName}: ${req.body.text}`
+        : `📎 ${senderName} sent an attachment`;
+
+      for (const recipientId of recipients) {
+        sendPushNotification(
+          recipientId,
+          senderName,
+          notificationBody,
+          { type: 'new_message', conversationId: conversation._id.toString() }
+        );
+      }
+
       res.status(201).json({ message });
     } catch (error) {
       console.error('Send message error:', error);
