@@ -373,210 +373,164 @@ const isParticipant = (conversation, userId) =>
   conversation.participants.map(String).includes(String(userId));
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  ENHANCED PUSH NOTIFICATIONS WITH LOGOS & RICH STYLES
-//  FIXED: imageUrl must be valid URL or undefined
+//  PUSH NOTIFICATIONS  (drop-in replacement for the entire notification section)
+//  Paste this over the old sendPushNotification + convenience functions.
 // ══════════════════════════════════════════════════════════════════════════════
 
-const sendPushNotification = async (userId, title, body, data = {}, options = {}) => {
+// ── Core send ─────────────────────────────────────────────────────────────────
+const sendPushNotification = async (userId, title, body, data = {}) => {
   try {
-    if (!admin.apps || admin.apps.length === 0) return;
+    if (!admin.apps || admin.apps.length === 0) {
+      console.warn('⚠️  Firebase Admin not initialised – skipping push');
+      return;
+    }
 
-    const user = await User.findById(userId).select('fcmToken fullName');
-    if (!user || !user.fcmToken) return;
+    const user = await User.findById(userId).select('fcmToken');
+    if (!user) { console.log(`⚠️  User ${userId} not found`); return; }
+    if (!user.fcmToken) { console.log(`⚠️  User ${userId} has no FCM token`); return; }
 
+    // All data values MUST be strings
     const stringData = {};
     for (const [k, v] of Object.entries(data)) {
       stringData[k] = String(v);
     }
 
-    const {
-      type = 'general',
-      imageUrl = null,
-      sound = 'default',
-      badge = '1',
-      channelId = 'covrly_default_channel',
-    } = options;
-
-    const typeConfig = {
-      message: {
-        icon: 'ic_message',
-        color: '#6366F1',
-        channelName: 'Messages',
-        priority: 'high',
-      },
-      job: {
-        icon: 'ic_job',
-        color: '#10B981',
-        channelName: 'Job Alerts',
-        priority: 'high',
-      },
-      certificate: {
-        icon: 'ic_certificate',
-        color: '#F59E0B',
-        channelName: 'Certificate Reminders',
-        priority: 'high',
-      },
-      review: {
-        icon: 'ic_review',
-        color: '#EC4899',
-        channelName: 'Reviews',
-        priority: 'default',
-      },
-      application: {
-        icon: 'ic_application',
-        color: '#3B82F6',
-        channelName: 'Applications',
-        priority: 'high',
-      },
-      general: {
-        icon: 'ic_notification',
-        color: '#667EEA',
-        channelName: 'General',
-        priority: 'default',
-      },
-    };
-
-    const config = typeConfig[type] || typeConfig.general;
-
-    // Build notification object - ONLY include imageUrl if it's a valid URL
-    const notification = {
-      title: title,
-      body: body,
-    };
-    
-    // ✅ FIXED: Only add imageUrl if it's a valid non-empty URL
-    if (imageUrl && typeof imageUrl === 'string' && imageUrl.startsWith('http')) {
-      notification.imageUrl = imageUrl;
-    }
-
-    // Build Android notification - ONLY include imageUrl if valid
-    const androidNotification = {
-      channelId: channelId,
-      channelName: config.channelName,
-      sound: sound,
-      priority: config.priority === 'high' ? 'high' : 'default',
-      defaultVibrateTimings: true,
-      defaultSound: true,
-      visibility: 'public',
-      icon: config.icon,
-      color: config.color,
-      clickAction: 'FLUTTER_NOTIFICATION_CLICK',
-      style: notification.imageUrl ? 'bigPicture' : 'bigText',
-      bigText: body,
-    };
-
-    // ✅ FIXED: Only add imageUrl to android.notification if valid
-    if (notification.imageUrl) {
-      androidNotification.imageUrl = notification.imageUrl;
-    }
-
-    // Action buttons for messages
-    if (type === 'message') {
-      androidNotification.actions = [
-        { title: 'Reply', action: 'reply_action', icon: 'ic_reply' },
-        { title: 'Mark Read', action: 'read_action', icon: 'ic_done' },
-      ];
-    }
-
+    // ✅ ONLY valid FCM v1 fields — no channelName, style, bigText, actions, etc.
     const message = {
       token: user.fcmToken,
-      notification: notification,
-      android: {
-        priority: config.priority,
-        notification: androidNotification,
-      },
-      apns: {
-        payload: {
-          aps: {
-            alert: { title: title, body: body },
-            badge: parseInt(badge),
-            sound: sound,
-            category: type,
-            'mutable-content': 1,
-          },
-        },
-        // ✅ FIXED: Only include fcmOptions.imageUrl if valid
-        ...(notification.imageUrl ? { fcmOptions: { imageUrl: notification.imageUrl } } : {}),
-      },
-      data: {
-        type: type,
+
+      // Required: system uses this to display when app is background/killed
+      notification: {
         title: String(title),
-        body: String(body),
-        iconColor: config.color,
+        body:  String(body),
+      },
+
+      // ✅ android.priority = 'high' wakes the device even in Doze mode (Android 9)
+      android: {
+        priority: 'high',
+        notification: {
+          channelId:             'covrly_default_channel', // matches Flutter channel
+          sound:                 'default',
+          defaultVibrateTimings: true,
+          notificationPriority:  'PRIORITY_HIGH',          // valid FCM enum
+          visibility:            'PUBLIC',                 // valid FCM enum
+          clickAction:           'FLUTTER_NOTIFICATION_CLICK',
+        },
+      },
+
+      // Data payload for in-app navigation after tap
+      data: {
+        title: String(title),
+        body:  String(body),
         ...stringData,
       },
     };
 
     const response = await admin.messaging().send(message);
-    console.log(`📲 Push sent to user ${userId}:`, response);
+    console.log(`📲 Push sent to user ${userId} → ${response}`);
     return response;
 
   } catch (error) {
-    console.error('❌ Push notification error:', error.message);
+    console.error(`❌ FCM error for user ${userId}:`, error.code, error.message);
+
+    // Auto-clean invalid tokens
     if (
       error.code === 'messaging/invalid-registration-token' ||
       error.code === 'messaging/registration-token-not-registered'
     ) {
       await User.findByIdAndUpdate(userId, { fcmToken: null });
-      console.log(`🗑️ Removed invalid FCM token for user ${userId}`);
+      console.log(`🗑️  Removed invalid FCM token for user ${userId}`);
     }
   }
 };
 
-// Convenience methods - NO imageUrl by default
-const sendMessageNotification = async (recipientId, senderName, messageText, conversationId) => {
-  return sendPushNotification(
+// ── Convenience wrappers ───────────────────────────────────────────────────────
+const sendMessageNotification = (recipientId, senderName, text, conversationId) =>
+  sendPushNotification(
     recipientId,
     senderName,
-    messageText.length > 60 ? messageText.substring(0, 60) + '...' : messageText,
-    {
-      type: 'message',
-      conversationId: conversationId,
-      senderName: senderName,
-    },
-    { type: 'message' }  // No imageUrl
+    text.length > 80 ? text.substring(0, 80) + '…' : text,
+    { type: 'new_message', conversationId }
   );
-};
 
-const sendJobNotification = async (userId, jobTitle, company, jobId) => {
-  return sendPushNotification(
-    userId,
-    '🆕 New Job: ' + jobTitle,
-    `Posted by ${company}`,
-    { type: 'job', jobId: jobId },
-    { type: 'job' }  // No imageUrl
-  );
-};
-
-const sendCertificateNotification = async (userId, certName, daysLeft) => {
-  return sendPushNotification(
-    userId,
-    '⏰ Certificate Expiring Soon',
-    `${certName} expires in ${daysLeft} days. Renew now!`,
-    { type: 'certificate', certName: certName },
-    { type: 'certificate' }  // No imageUrl
-  );
-};
-
-const sendReviewNotification = async (businessId, reviewerName, rating) => {
-  return sendPushNotification(
+const sendApplicationNotification = (businessId, applicantName, jobTitle, jobId) =>
+  sendPushNotification(
     businessId,
-    '⭐ New Review',
-    `${reviewerName} gave you ${rating} stars`,
-    { type: 'review', rating: rating },
-    { type: 'review' }  // No imageUrl
-  );
-};
-
-const sendApplicationNotification = async (businessId, applicantName, jobTitle, jobId) => {
-  return sendPushNotification(
-    businessId,
-    '📨 New Application',
+    'New Application',
     `${applicantName} applied for ${jobTitle}`,
-    { type: 'application', jobId: jobId },
-    { type: 'application' }  // No imageUrl
+    { type: 'job_application', jobId }
   );
-};
+
+const sendJobNotification = (userId, jobTitle, company, jobId) =>
+  sendPushNotification(
+    userId,
+    `New Job: ${jobTitle}`,
+    `Posted by ${company}`,
+    { type: 'job', jobId }
+  );
+
+const sendCertificateNotification = (userId, certName, daysLeft) =>
+  sendPushNotification(
+    userId,
+    'Certificate Expiring Soon',
+    `${certName} expires in ${daysLeft} days`,
+    { type: 'certificate', certName }
+  );
+
+const sendReviewNotification = (businessId, reviewerName, rating) =>
+  sendPushNotification(
+    businessId,
+    'New Review',
+    `${reviewerName} gave you ${rating} stars`,
+    { type: 'review', rating }
+  );
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  TEST ENDPOINT  — hit this from Postman/browser to confirm FCM works end-to-end
+//  DELETE this route before going to production.
+//  Usage: POST /api/test-push  { "userId": "...", "title": "Hello", "body": "World" }
+// ══════════════════════════════════════════════════════════════════════════════
+app.post('/api/test-push', async (req, res) => {
+  try {
+    const { userId, title = 'Test', body = 'Push is working! 🎉', token } = req.body;
+
+    // Direct token test (no DB lookup)
+    if (token) {
+      if (!admin.apps || admin.apps.length === 0) {
+        return res.status(500).json({ message: 'Firebase Admin not initialised' });
+      }
+      const message = {
+        token,
+        notification: { title, body },
+        android: {
+          priority: 'high',
+          notification: {
+            channelId:             'covrly_default_channel',
+            sound:                 'default',
+            defaultVibrateTimings: true,
+            notificationPriority:  'PRIORITY_HIGH',
+            visibility:            'PUBLIC',
+            clickAction:           'FLUTTER_NOTIFICATION_CLICK',
+          },
+        },
+        data: { type: 'test', title, body },
+      };
+      const response = await admin.messaging().send(message);
+      return res.json({ success: true, response });
+    }
+
+    // User-ID based test (DB lookup)
+    if (!userId) {
+      return res.status(400).json({ message: 'Provide userId or token' });
+    }
+    await sendPushNotification(userId, title, body, { type: 'test' });
+    res.json({ success: true, message: `Notification sent to user ${userId}` });
+
+  } catch (err) {
+    console.error('Test push error:', err);
+    res.status(500).json({ message: err.message });
+  }
+});
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  AUTH ROUTES
