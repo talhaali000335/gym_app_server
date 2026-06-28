@@ -23,12 +23,9 @@ if (!process.env.JWT_SECRET) {
 }
 
 // ── Firebase Admin initialisation ─────────────────────────────────────────────
-// ✅ FIX 1 + FIX 2: Parse env JSON and repair Vercel's double-escaped \n in private_key
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
   try {
     const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-
-    // ✅ CRITICAL for Vercel: repair escaped newlines in the private key
     serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
 
     if (admin.apps.length === 0) {
@@ -206,6 +203,12 @@ userSchema.set('toJSON', {
 
 const User = mongoose.model('User', userSchema);
 
+const availabilitySlotSchema = new mongoose.Schema({
+  date:   { type: String, required: true },
+  status: { type: String, enum: ['open', 'limited', 'full', 'unavailable'], default: 'open' },
+  note:   { type: String, default: '' },
+}, { _id: true });
+
 const jobSchema = new mongoose.Schema(
   {
     title:            { type: String, required: true, trim: true },
@@ -222,6 +225,10 @@ const jobSchema = new mongoose.Schema(
     maxClients:       { type: Number, default: null },
     coverTime:        { type: String, default: '' },
     postedBy:         { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    // ── NEW: Availability & Slots ──────────────────────────────────
+    maxSlots:              { type: Number, default: 16 },
+    filledSlots:           { type: Number, default: 0 },
+    availabilityCalendar:  [availabilitySlotSchema],
   },
   { timestamps: true }
 );
@@ -298,6 +305,21 @@ const messageSchema = new mongoose.Schema(
 messageSchema.index({ conversation: 1, createdAt: -1 });
 const Message = mongoose.model('Message', messageSchema);
 
+// ── NEW: Review Schema ─────────────────────────────────────────────────────────
+const reviewSchema = new mongoose.Schema(
+  {
+    reviewer: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    business: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    job:      { type: mongoose.Schema.Types.ObjectId, ref: 'Job', default: null },
+    rating:   { type: Number, required: true, min: 1, max: 5 },
+    comment:  { type: String, required: true, trim: true, maxlength: 1000 },
+  },
+  { timestamps: true }
+);
+reviewSchema.index({ business: 1, createdAt: -1 });
+reviewSchema.index({ reviewer: 1, business: 1 }, { unique: true });
+const Review = mongoose.model('Review', reviewSchema);
+
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 const uploadToCloudinary = (buffer, folder, resource_type = 'auto') =>
@@ -350,42 +372,117 @@ const onboardingAuth = async (req, res, next) => {
 const isParticipant = (conversation, userId) =>
   conversation.participants.map(String).includes(String(userId));
 
-// ── ✅ FIX 3: sendPushNotification with full Android config ───────────────────
-const sendPushNotification = async (userId, title, body, data = {}) => {
+// ══════════════════════════════════════════════════════════════════════════════
+//  ENHANCED PUSH NOTIFICATIONS WITH LOGOS & RICH STYLES
+// ══════════════════════════════════════════════════════════════════════════════
+
+const sendPushNotification = async (userId, title, body, data = {}, options = {}) => {
   try {
     if (!admin.apps || admin.apps.length === 0) return;
 
-    const user = await User.findById(userId).select('fcmToken');
+    const user = await User.findById(userId).select('fcmToken fullName');
     if (!user || !user.fcmToken) return;
 
-    // Convert all data values to strings (FCM requirement)
     const stringData = {};
     for (const [k, v] of Object.entries(data)) {
       stringData[k] = String(v);
     }
 
+    const {
+      type = 'general',
+      imageUrl = null,
+      sound = 'default',
+      badge = '1',
+      channelId = 'covrly_default_channel',
+    } = options;
+
+    const typeConfig = {
+      message: {
+        icon: 'ic_message',
+        color: '#6366F1',
+        channelName: 'Messages',
+        priority: 'high',
+      },
+      job: {
+        icon: 'ic_job',
+        color: '#10B981',
+        channelName: 'Job Alerts',
+        priority: 'high',
+      },
+      certificate: {
+        icon: 'ic_certificate',
+        color: '#F59E0B',
+        channelName: 'Certificate Reminders',
+        priority: 'high',
+      },
+      review: {
+        icon: 'ic_review',
+        color: '#EC4899',
+        channelName: 'Reviews',
+        priority: 'default',
+      },
+      application: {
+        icon: 'ic_application',
+        color: '#3B82F6',
+        channelName: 'Applications',
+        priority: 'high',
+      },
+      general: {
+        icon: 'ic_notification',
+        color: '#667EEA',
+        channelName: 'General',
+        priority: 'default',
+      },
+    };
+
+    const config = typeConfig[type] || typeConfig.general;
+
     const message = {
       token: user.fcmToken,
-
-      // System notification shown when app is killed or background
-      notification: { title, body },
-
-      // ✅ Android priority — without this Android 9 drops the notification
+      notification: {
+        title: title,
+        body: body,
+        imageUrl: imageUrl,
+      },
       android: {
-        priority: 'high',
+        priority: config.priority,
         notification: {
-          channelId: 'covrly_default_channel',   // must match Flutter channel id
-          sound: 'default',
-          priority: 'high',
+          channelId: channelId,
+          channelName: config.channelName,
+          sound: sound,
+          priority: config.priority === 'high' ? 'high' : 'default',
           defaultVibrateTimings: true,
+          defaultSound: true,
+          visibility: 'public',
+          icon: config.icon,
+          color: config.color,
+          imageUrl: imageUrl,
           clickAction: 'FLUTTER_NOTIFICATION_CLICK',
+          style: imageUrl ? 'bigPicture' : 'bigText',
+          bigText: body,
+          actions: type === 'message' ? [
+            { title: 'Reply', action: 'reply_action', icon: 'ic_reply' },
+            { title: 'Mark Read', action: 'read_action', icon: 'ic_done' },
+          ] : [],
         },
       },
-
-      // Data payload for in-app navigation
+      apns: {
+        payload: {
+          aps: {
+            alert: { title: title, body: body },
+            badge: parseInt(badge),
+            sound: sound,
+            category: type,
+            'mutable-content': 1,
+          },
+        },
+        fcmOptions: { imageUrl: imageUrl },
+      },
       data: {
+        type: type,
         title: String(title),
-        body:  String(body),
+        body: String(body),
+        iconColor: config.color,
         ...stringData,
       },
     };
@@ -393,17 +490,68 @@ const sendPushNotification = async (userId, title, body, data = {}) => {
     const response = await admin.messaging().send(message);
     console.log(`📲 Push sent to user ${userId}:`, response);
     return response;
+
   } catch (error) {
     console.error('❌ Push notification error:', error.message);
-    // Remove invalid/expired tokens from DB automatically
     if (
       error.code === 'messaging/invalid-registration-token' ||
       error.code === 'messaging/registration-token-not-registered'
     ) {
       await User.findByIdAndUpdate(userId, { fcmToken: null });
-      console.log(`🗑️  Removed invalid FCM token for user ${userId}`);
+      console.log(`🗑️ Removed invalid FCM token for user ${userId}`);
     }
   }
+};
+
+// Convenience methods
+const sendMessageNotification = async (recipientId, senderName, messageText, conversationId) => {
+  return sendPushNotification(
+    recipientId,
+    senderName,
+    messageText.length > 60 ? messageText.substring(0, 60) + '...' : messageText,
+    { type: 'message', conversationId: conversationId, senderName: senderName },
+    { type: 'message' }
+  );
+};
+
+const sendJobNotification = async (userId, jobTitle, company, jobId) => {
+  return sendPushNotification(
+    userId,
+    '🆕 New Job: ' + jobTitle,
+    `Posted by ${company}`,
+    { type: 'job', jobId: jobId },
+    { type: 'job' }
+  );
+};
+
+const sendCertificateNotification = async (userId, certName, daysLeft) => {
+  return sendPushNotification(
+    userId,
+    '⏰ Certificate Expiring Soon',
+    `${certName} expires in ${daysLeft} days. Renew now!`,
+    { type: 'certificate', certName: certName },
+    { type: 'certificate' }
+  );
+};
+
+const sendReviewNotification = async (businessId, reviewerName, rating) => {
+  return sendPushNotification(
+    businessId,
+    '⭐ New Review',
+    `${reviewerName} gave you ${rating} stars`,
+    { type: 'review', rating: rating },
+    { type: 'review' }
+  );
+};
+
+const sendApplicationNotification = async (businessId, applicantName, jobTitle, jobId) => {
+  return sendPushNotification(
+    businessId,
+    '📨 New Application',
+    `${applicantName} applied for ${jobTitle}`,
+    { type: 'application', jobId: jobId },
+    { type: 'application' }
+  );
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -743,6 +891,7 @@ app.post('/api/jobs', authenticate, async (req, res) => {
     const {
       title, company, location, salary, jobType, workingPlaceType,
       description, requirements, schedule, rate, distance, maxClients, coverTime,
+      maxSlots,
     } = req.body;
 
     if (!title || !company || !location || !salary || !jobType)
@@ -751,6 +900,7 @@ app.post('/api/jobs', authenticate, async (req, res) => {
     const job = await Job.create({
       title, company, location, salary, jobType, workingPlaceType,
       description, requirements, schedule, rate, distance, maxClients, coverTime,
+      maxSlots: maxSlots || 16,
       postedBy: req.user.userId,
     });
     res.status(201).json({ message: 'Job posted successfully', job });
@@ -764,12 +914,56 @@ app.post('/api/jobs', authenticate, async (req, res) => {
   }
 });
 
+// ── Update Job Availability (Business only) ────────────────────────────────────
+app.put('/api/jobs/:id/availability', authenticate, async (req, res) => {
+  try {
+    if (req.user.role !== 'Business') {
+      return res.status(403).json({ message: 'Only Business accounts can update availability.' });
+    }
+
+    const { availabilityCalendar } = req.body;
+    const job = await Job.findOne({ _id: req.params.id, postedBy: req.user.userId });
+    if (!job) return res.status(404).json({ message: 'Job not found or not owned by you.' });
+
+    job.availabilityCalendar = availabilityCalendar || [];
+    await job.save();
+
+    res.json({ message: 'Availability updated.', job });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ── Get Job Availability ─────────────────────────────────────────────────────
+app.get('/api/jobs/:id/availability', async (req, res) => {
+  try {
+    const job = await Job.findById(req.params.id).select('availabilityCalendar maxSlots filledSlots title company');
+    if (!job) return res.status(404).json({ message: 'Job not found.' });
+
+    const availableSlots = job.maxSlots - job.filledSlots;
+    res.json({
+      calendar: job.availabilityCalendar || [],
+      maxSlots: job.maxSlots,
+      filledSlots: job.filledSlots,
+      availableSlots,
+      isFull: availableSlots <= 0,
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ── Apply for Job (with slot management) ─────────────────────────────────────
 app.post('/api/jobs/:id/apply', authenticate, (req, res) => {
   uploadAppDocs(req, res, async (err) => {
     if (err) return res.status(400).json({ message: err.message });
     try {
       const job = await Job.findById(req.params.id);
       if (!job) return res.status(404).json({ message: 'Job not found.' });
+
+      if (job.filledSlots >= job.maxSlots) {
+        return res.status(400).json({ message: 'This job is no longer accepting applications. All slots are filled.' });
+      }
 
       const { fullName, email, phone, coverLetter } = req.body;
       if (!fullName || !email || !phone)
@@ -794,17 +988,23 @@ app.post('/api/jobs/:id/apply', authenticate, (req, res) => {
         documents,
       });
 
-      console.log(`📨  New application for "${job.title}" by ${email}`);
+      job.filledSlots += 1;
+      await job.save();
 
-      // ✅ Push notification to job poster with full android config
-      sendPushNotification(
+      console.log(`📨 New application for "${job.title}" by ${email}. Slots: ${job.filledSlots}/${job.maxSlots}`);
+
+      sendApplicationNotification(
         job.postedBy,
-        'New Application Received',
-        `${fullName} applied for ${job.title}`,
-        { type: 'job_application', jobId: job._id.toString() }
+        fullName,
+        job.title,
+        job._id.toString()
       );
 
-      res.status(201).json({ message: 'Application submitted successfully.', application });
+      res.status(201).json({
+        message: 'Application submitted successfully.',
+        application,
+        slotsLeft: job.maxSlots - job.filledSlots,
+      });
     } catch (error) {
       console.error('Apply error:', error);
       res.status(500).json({ message: 'Server error. Please try again.' });
@@ -821,7 +1021,141 @@ app.get('/api/applications/me', authenticate, async (req, res) => {
       })
       .sort({ createdAt: -1 });
 
-    res.json({ count: applications.length, applications });
+    const enriched = applications.map(app => ({
+      ...app.toObject(),
+      slotsLeft: app.job ? app.job.maxSlots - app.job.filledSlots : 0,
+      isFull: app.job ? app.job.filledSlots >= app.job.maxSlots : true,
+    }));
+
+    res.json({ count: enriched.length, applications: enriched });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  REVIEW ROUTES
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.post('/api/reviews', authenticate, async (req, res) => {
+  try {
+    if (req.user.role !== 'Practitioner') {
+      return res.status(403).json({ message: 'Only Practitioners can submit reviews.' });
+    }
+
+    const { businessId, jobId, rating, comment } = req.body;
+    if (!businessId || !rating || !comment) {
+      return res.status(400).json({ message: 'businessId, rating, and comment are required.' });
+    }
+    if (rating < 1 || rating > 5) {
+      return res.status(400).json({ message: 'Rating must be between 1 and 5.' });
+    }
+
+    const business = await User.findById(businessId);
+    if (!business || business.role !== 'Business') {
+      return res.status(404).json({ message: 'Business account not found.' });
+    }
+
+    if (jobId) {
+      const application = await Application.findOne({
+        applicant: req.user.userId,
+        job: jobId,
+      }).populate('job');
+      if (!application || application.job.postedBy.toString() !== businessId) {
+        return res.status(403).json({ message: 'You can only review businesses after applying to their job.' });
+      }
+    }
+
+    const review = await Review.create({
+      reviewer: req.user.userId,
+      business: businessId,
+      job: jobId || null,
+      rating,
+      comment,
+    });
+
+    sendReviewNotification(businessId, req.user.fullName || 'Someone', rating);
+
+    res.status(201).json({ message: 'Review submitted successfully.', review });
+  } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({ message: 'You have already reviewed this business.' });
+    }
+    console.error('Review error:', err);
+    res.status(500).json({ message: 'Server error.' });
+  }
+});
+
+app.get('/api/reviews/business/:businessId', async (req, res) => {
+  try {
+    const page  = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(50, parseInt(req.query.limit) || 10);
+    const skip  = (page - 1) * limit;
+
+    const [reviews, totalCount, stats] = await Promise.all([
+      Review.find({ business: req.params.businessId })
+        .populate('reviewer', 'fullName profilePhoto')
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      Review.countDocuments({ business: req.params.businessId }),
+      Review.aggregate([
+        { $match: { business: new mongoose.Types.ObjectId(req.params.businessId) } },
+        {
+          $group: {
+            _id: null,
+            avgRating: { $avg: '$rating' },
+            totalReviews: { $sum: 1 },
+            fiveStar: { $sum: { $cond: [{ $eq: ['$rating', 5] }, 1, 0] } },
+            fourStar: { $sum: { $cond: [{ $eq: ['$rating', 4] }, 1, 0] } },
+            threeStar: { $sum: { $cond: [{ $eq: ['$rating', 3] }, 1, 0] } },
+            twoStar: { $sum: { $cond: [{ $eq: ['$rating', 2] }, 1, 0] } },
+            oneStar: { $sum: { $cond: [{ $eq: ['$rating', 1] }, 1, 0] } },
+          },
+        },
+      ]),
+    ]);
+
+    const summary = stats[0] || {
+      avgRating: 0, totalReviews: 0,
+      fiveStar: 0, fourStar: 0, threeStar: 0, twoStar: 0, oneStar: 0,
+    };
+
+    res.json({
+      reviews,
+      summary: {
+        ...summary,
+        avgRating: Math.round(summary.avgRating * 10) / 10,
+      },
+      currentPage: page,
+      totalPages: Math.ceil(totalCount / limit),
+      totalCount,
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+app.get('/api/reviews/me', authenticate, async (req, res) => {
+  try {
+    const reviews = await Review.find({ reviewer: req.user.userId })
+      .populate('business', 'fullName profilePhoto company')
+      .sort({ createdAt: -1 });
+    res.json({ reviews });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+app.delete('/api/reviews/:id', authenticate, async (req, res) => {
+  try {
+    const review = await Review.findOneAndDelete({
+      _id: req.params.id,
+      reviewer: req.user.userId,
+    });
+    if (!review) return res.status(404).json({ message: 'Review not found.' });
+    res.json({ message: 'Review deleted.' });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -1007,22 +1341,20 @@ app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
       conversation.lastMessage = message._id;
       await conversation.save();
 
-      // ✅ Push notification to all recipients with full android config
+      // Send push notification to recipients
       const recipients = conversation.participants.filter(
         (p) => p.toString() !== req.user.userId.toString()
       );
       const sender = await User.findById(req.user.userId).select('fullName');
-      const senderName     = sender?.fullName || 'Someone';
-      const notificationBody = req.body.text
-        ? req.body.text
-        : '📎 Sent an attachment';
+      const senderName = sender?.fullName || 'Someone';
+      const notificationBody = req.body.text ? req.body.text : '📎 Sent an attachment';
 
       for (const recipientId of recipients) {
-        sendPushNotification(
+        sendMessageNotification(
           recipientId,
           senderName,
           notificationBody,
-          { type: 'new_message', conversationId: conversation._id.toString() }
+          conversation._id.toString()
         );
       }
 
