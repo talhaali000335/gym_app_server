@@ -374,6 +374,7 @@ const isParticipant = (conversation, userId) =>
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  ENHANCED PUSH NOTIFICATIONS WITH LOGOS & RICH STYLES
+//  FIXED: imageUrl must be valid URL or undefined
 // ══════════════════════════════════════════════════════════════════════════════
 
 const sendPushNotification = async (userId, title, body, data = {}, options = {}) => {
@@ -437,34 +438,52 @@ const sendPushNotification = async (userId, title, body, data = {}, options = {}
 
     const config = typeConfig[type] || typeConfig.general;
 
+    // Build notification object - ONLY include imageUrl if it's a valid URL
+    const notification = {
+      title: title,
+      body: body,
+    };
+    
+    // ✅ FIXED: Only add imageUrl if it's a valid non-empty URL
+    if (imageUrl && typeof imageUrl === 'string' && imageUrl.startsWith('http')) {
+      notification.imageUrl = imageUrl;
+    }
+
+    // Build Android notification - ONLY include imageUrl if valid
+    const androidNotification = {
+      channelId: channelId,
+      channelName: config.channelName,
+      sound: sound,
+      priority: config.priority === 'high' ? 'high' : 'default',
+      defaultVibrateTimings: true,
+      defaultSound: true,
+      visibility: 'public',
+      icon: config.icon,
+      color: config.color,
+      clickAction: 'FLUTTER_NOTIFICATION_CLICK',
+      style: notification.imageUrl ? 'bigPicture' : 'bigText',
+      bigText: body,
+    };
+
+    // ✅ FIXED: Only add imageUrl to android.notification if valid
+    if (notification.imageUrl) {
+      androidNotification.imageUrl = notification.imageUrl;
+    }
+
+    // Action buttons for messages
+    if (type === 'message') {
+      androidNotification.actions = [
+        { title: 'Reply', action: 'reply_action', icon: 'ic_reply' },
+        { title: 'Mark Read', action: 'read_action', icon: 'ic_done' },
+      ];
+    }
+
     const message = {
       token: user.fcmToken,
-      notification: {
-        title: title,
-        body: body,
-        imageUrl: imageUrl,
-      },
+      notification: notification,
       android: {
         priority: config.priority,
-        notification: {
-          channelId: channelId,
-          channelName: config.channelName,
-          sound: sound,
-          priority: config.priority === 'high' ? 'high' : 'default',
-          defaultVibrateTimings: true,
-          defaultSound: true,
-          visibility: 'public',
-          icon: config.icon,
-          color: config.color,
-          imageUrl: imageUrl,
-          clickAction: 'FLUTTER_NOTIFICATION_CLICK',
-          style: imageUrl ? 'bigPicture' : 'bigText',
-          bigText: body,
-          actions: type === 'message' ? [
-            { title: 'Reply', action: 'reply_action', icon: 'ic_reply' },
-            { title: 'Mark Read', action: 'read_action', icon: 'ic_done' },
-          ] : [],
-        },
+        notification: androidNotification,
       },
       apns: {
         payload: {
@@ -476,7 +495,8 @@ const sendPushNotification = async (userId, title, body, data = {}, options = {}
             'mutable-content': 1,
           },
         },
-        fcmOptions: { imageUrl: imageUrl },
+        // ✅ FIXED: Only include fcmOptions.imageUrl if valid
+        ...(notification.imageUrl ? { fcmOptions: { imageUrl: notification.imageUrl } } : {}),
       },
       data: {
         type: type,
@@ -503,14 +523,18 @@ const sendPushNotification = async (userId, title, body, data = {}, options = {}
   }
 };
 
-// Convenience methods
+// Convenience methods - NO imageUrl by default
 const sendMessageNotification = async (recipientId, senderName, messageText, conversationId) => {
   return sendPushNotification(
     recipientId,
     senderName,
     messageText.length > 60 ? messageText.substring(0, 60) + '...' : messageText,
-    { type: 'message', conversationId: conversationId, senderName: senderName },
-    { type: 'message' }
+    {
+      type: 'message',
+      conversationId: conversationId,
+      senderName: senderName,
+    },
+    { type: 'message' }  // No imageUrl
   );
 };
 
@@ -520,7 +544,7 @@ const sendJobNotification = async (userId, jobTitle, company, jobId) => {
     '🆕 New Job: ' + jobTitle,
     `Posted by ${company}`,
     { type: 'job', jobId: jobId },
-    { type: 'job' }
+    { type: 'job' }  // No imageUrl
   );
 };
 
@@ -530,7 +554,7 @@ const sendCertificateNotification = async (userId, certName, daysLeft) => {
     '⏰ Certificate Expiring Soon',
     `${certName} expires in ${daysLeft} days. Renew now!`,
     { type: 'certificate', certName: certName },
-    { type: 'certificate' }
+    { type: 'certificate' }  // No imageUrl
   );
 };
 
@@ -540,7 +564,7 @@ const sendReviewNotification = async (businessId, reviewerName, rating) => {
     '⭐ New Review',
     `${reviewerName} gave you ${rating} stars`,
     { type: 'review', rating: rating },
-    { type: 'review' }
+    { type: 'review' }  // No imageUrl
   );
 };
 
@@ -550,7 +574,7 @@ const sendApplicationNotification = async (businessId, applicantName, jobTitle, 
     '📨 New Application',
     `${applicantName} applied for ${jobTitle}`,
     { type: 'application', jobId: jobId },
-    { type: 'application' }
+    { type: 'application' }  // No imageUrl
   );
 };
 
