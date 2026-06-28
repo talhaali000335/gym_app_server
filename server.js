@@ -377,74 +377,68 @@ const isParticipant = (conversation, userId) =>
 //  Paste this over the old sendPushNotification + convenience functions.
 // ══════════════════════════════════════════════════════════════════════════════
 
-// ── Core send ─────────────────────────────────────────────────────────────────
+// ── Channel map (type → Flutter channel id) ────────────────────────────────
+const TYPE_TO_CHANNEL = {
+  new_message:     'covrly_messages',
+  message:         'covrly_messages',
+  job:             'covrly_jobs',
+  job_application: 'covrly_applications',
+  application:     'covrly_applications',
+  certificate:     'covrly_certificates',
+  review:          'covrly_reviews',
+};
+
+// ── Core send ──────────────────────────────────────────────────────────────
 const sendPushNotification = async (userId, title, body, data = {}) => {
   try {
-    if (!admin.apps || admin.apps.length === 0) {
-      console.warn('⚠️  Firebase Admin not initialised – skipping push');
+    if (!admin.apps || admin.apps.length === 0) return;
+
+    const user = await User.findById(userId).select('fcmToken');
+    if (!user?.fcmToken) {
+      console.log(`⚠️  No FCM token for user ${userId}`);
       return;
     }
 
-    const user = await User.findById(userId).select('fcmToken');
-    if (!user) { console.log(`⚠️  User ${userId} not found`); return; }
-    if (!user.fcmToken) { console.log(`⚠️  User ${userId} has no FCM token`); return; }
-
-    // All data values MUST be strings
     const stringData = {};
-    for (const [k, v] of Object.entries(data)) {
-      stringData[k] = String(v);
-    }
+    for (const [k, v] of Object.entries(data)) stringData[k] = String(v);
 
-    // ✅ ONLY valid FCM v1 fields — no channelName, style, bigText, actions, etc.
+    const type      = data.type || 'general';
+    const channelId = TYPE_TO_CHANNEL[type] || 'covrly_default_channel';
+
     const message = {
       token: user.fcmToken,
-
-      // Required: system uses this to display when app is background/killed
-      notification: {
-        title: String(title),
-        body:  String(body),
-      },
-
-      // ✅ android.priority = 'high' wakes the device even in Doze mode (Android 9)
+      notification: { title: String(title), body: String(body) },
       android: {
-        priority: 'high',
+        priority: 'high',                        // wakes device from Doze (Android 9)
         notification: {
-          channelId:             'covrly_default_channel', // matches Flutter channel
+          channelId,                             // ✅ correct channel per type
           sound:                 'default',
           defaultVibrateTimings: true,
-          notificationPriority:  'PRIORITY_HIGH',          // valid FCM enum
-          visibility:            'PUBLIC',                 // valid FCM enum
+          notificationPriority:  'PRIORITY_HIGH',
+          visibility:            'PUBLIC',
           clickAction:           'FLUTTER_NOTIFICATION_CLICK',
         },
       },
-
-      // Data payload for in-app navigation after tap
-      data: {
-        title: String(title),
-        body:  String(body),
-        ...stringData,
-      },
+      data: { type, title: String(title), body: String(body), ...stringData },
     };
 
     const response = await admin.messaging().send(message);
-    console.log(`📲 Push sent to user ${userId} → ${response}`);
+    console.log(`📲 Push [${type}] → user ${userId}: ${response}`);
     return response;
 
   } catch (error) {
-    console.error(`❌ FCM error for user ${userId}:`, error.code, error.message);
-
-    // Auto-clean invalid tokens
+    console.error(`❌ FCM error [${data.type}] user ${userId}:`, error.code, error.message);
     if (
       error.code === 'messaging/invalid-registration-token' ||
       error.code === 'messaging/registration-token-not-registered'
     ) {
       await User.findByIdAndUpdate(userId, { fcmToken: null });
-      console.log(`🗑️  Removed invalid FCM token for user ${userId}`);
+      console.log(`🗑️  Removed stale FCM token for user ${userId}`);
     }
   }
 };
 
-// ── Convenience wrappers ───────────────────────────────────────────────────────
+// ── Convenience wrappers ───────────────────────────────────────────────────
 const sendMessageNotification = (recipientId, senderName, text, conversationId) =>
   sendPushNotification(
     recipientId,
@@ -465,7 +459,7 @@ const sendJobNotification = (userId, jobTitle, company, jobId) =>
   sendPushNotification(
     userId,
     `New Job: ${jobTitle}`,
-    `Posted by ${company}`,
+    `${company} is hiring`,
     { type: 'job', jobId }
   );
 
@@ -868,8 +862,8 @@ app.post('/api/jobs', authenticate, async (req, res) => {
 
     const {
       title, company, location, salary, jobType, workingPlaceType,
-      description, requirements, schedule, rate, distance, maxClients, coverTime,
-      maxSlots,
+      description, requirements, schedule, rate, distance, maxClients,
+      coverTime, maxSlots,
     } = req.body;
 
     if (!title || !company || !location || !salary || !jobType)
@@ -877,15 +871,36 @@ app.post('/api/jobs', authenticate, async (req, res) => {
 
     const job = await Job.create({
       title, company, location, salary, jobType, workingPlaceType,
-      description, requirements, schedule, rate, distance, maxClients, coverTime,
-      maxSlots: maxSlots || 16,
+      description, requirements, schedule, rate, distance, maxClients,
+      coverTime, maxSlots: maxSlots || 16,
       postedBy: req.user.userId,
     });
+
+    // ✅ NEW: Notify all practitioners who have an FCM token
+    // Fire-and-forget — don't await so the response isn't delayed
+    User.find({ role: 'Practitioner', fcmToken: { $ne: null } })
+      .select('_id')
+      .lean()
+      .then((practitioners) => {
+        console.log(`📢 Notifying ${practitioners.length} practitioners about: ${title}`);
+        return Promise.allSettled(
+          practitioners.map((p) =>
+            sendJobNotification(p._id, title, company, job._id.toString())
+          )
+        );
+      })
+      .then((results) => {
+        const sent   = results.filter((r) => r.status === 'fulfilled').length;
+        const failed = results.filter((r) => r.status === 'rejected').length;
+        console.log(`📢 Job notifications: ${sent} sent, ${failed} failed`);
+      })
+      .catch((err) => console.error('Job notification batch error:', err.message));
+
     res.status(201).json({ message: 'Job posted successfully', job });
   } catch (err) {
     console.error('Job creation error:', err);
     if (err.name === 'ValidationError') {
-      const messages = Object.values(err.errors).map(e => e.message);
+      const messages = Object.values(err.errors).map((e) => e.message);
       return res.status(400).json({ message: messages.join(' | ') });
     }
     res.status(500).json({ message: 'Server error. Please try again.' });
