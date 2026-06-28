@@ -579,7 +579,7 @@ app.post('/api/register/complete', async (req, res) => {
     if (!user) return res.status(404).json({ message: 'User not found.' });
 
     const token = jwt.sign(
-      { userId: user._id, email: user.email, role: user.role },
+      { userId: user._id, email: user.email, role: user.role, fullName: user.fullName },
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
@@ -604,7 +604,7 @@ app.post('/api/login', async (req, res) => {
     if (!isMatch) return res.status(401).json({ message: 'Invalid email or password.' });
 
     const token = jwt.sign(
-      { userId: user._id, email: user.email, role: user.role },
+      { userId: user._id, email: user.email, role: user.role, fullName: user.fullName },
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
@@ -876,25 +876,30 @@ app.post('/api/jobs', authenticate, async (req, res) => {
       postedBy: req.user.userId,
     });
 
-    // ✅ NEW: Notify all practitioners who have an FCM token
-    // Fire-and-forget — don't await so the response isn't delayed
-    User.find({ role: 'Practitioner', fcmToken: { $ne: null } })
-      .select('_id')
-      .lean()
-      .then((practitioners) => {
-        console.log(`📢 Notifying ${practitioners.length} practitioners about: ${title}`);
-        return Promise.allSettled(
-          practitioners.map((p) =>
-            sendJobNotification(p._id, title, company, job._id.toString())
-          )
-        );
-      })
-      .then((results) => {
-        const sent   = results.filter((r) => r.status === 'fulfilled').length;
-        const failed = results.filter((r) => r.status === 'rejected').length;
-        console.log(`📢 Job notifications: ${sent} sent, ${failed} failed`);
-      })
-      .catch((err) => console.error('Job notification batch error:', err.message));
+    // ✅ FIX: this was a bare fire-and-forget .then() chain. Same problem as
+    // the application/review routes — on a serverless host (Vercel) the
+    // function can be frozen the instant res.json() below is sent, so an
+    // un-awaited batch can be cut short or skipped entirely. Awaiting it
+    // trades a bit of response latency for actually guaranteeing delivery.
+    // If this fan-out grows large enough that the delay becomes a problem,
+    // look at your platform's "keep function alive after response" hook
+    // (e.g. Vercel's `waitUntil`) instead of going back to fire-and-forget.
+    try {
+      const practitioners = await User.find({ role: 'Practitioner', fcmToken: { $ne: null } })
+        .select('_id')
+        .lean();
+      console.log(`📢 Notifying ${practitioners.length} practitioners about: ${title}`);
+      const results = await Promise.allSettled(
+        practitioners.map((p) =>
+          sendJobNotification(p._id, title, company, job._id.toString())
+        )
+      );
+      const sent   = results.filter((r) => r.status === 'fulfilled').length;
+      const failed = results.filter((r) => r.status === 'rejected').length;
+      console.log(`📢 Job notifications: ${sent} sent, ${failed} failed`);
+    } catch (notifyErr) {
+      console.error('Job notification batch error:', notifyErr.message);
+    }
 
     res.status(201).json({ message: 'Job posted successfully', job });
   } catch (err) {
@@ -986,7 +991,16 @@ app.post('/api/jobs/:id/apply', authenticate, (req, res) => {
 
       console.log(`📨 New application for "${job.title}" by ${email}. Slots: ${job.filledSlots}/${job.maxSlots}`);
 
-      sendApplicationNotification(
+      // ✅ FIX: this used to be a bare, un-awaited call. On a serverless
+      // host (Vercel — see module.exports at the bottom of this file) the
+      // function's execution context can be frozen the instant res.json()
+      // below returns, which can kill this notification before
+      // admin.messaging().send() ever actually fires. Awaiting it here
+      // guarantees the push is sent (or fails loudly in the console)
+      // before we respond. sendPushNotification() already catches its own
+      // errors internally, so this can never reject and will not turn a
+      // notification failure into a 500 for the applicant.
+      await sendApplicationNotification(
         job.postedBy,
         fullName,
         job.title,
@@ -1067,7 +1081,22 @@ app.post('/api/reviews', authenticate, async (req, res) => {
       comment,
     });
 
-    sendReviewNotification(businessId, req.user.fullName || 'Someone', rating);
+    // ✅ FIX: req.user.fullName never existed. The JWT payload signed in
+    // /api/login and /api/register/complete only carried
+    // { userId, email, role }, so req.user.fullName was always undefined
+    // and every review notification silently fell back to "Someone". Look
+    // the reviewer's real name up instead. (We've also added fullName to
+    // newly-issued JWTs above so this lookup becomes unnecessary going
+    // forward, but the DB lookup is kept here so it keeps working for
+    // anyone still holding an old token that doesn't have it.)
+    const reviewer = req.user.fullName
+      ? { fullName: req.user.fullName }
+      : await User.findById(req.user.userId).select('fullName');
+
+    // ✅ FIX: await this for the same reason as the application
+    // notification above — un-awaited async work after the DB write but
+    // before res.json() is not guaranteed to finish on a serverless host.
+    await sendReviewNotification(businessId, reviewer?.fullName || 'Someone', rating);
 
     res.status(201).json({ message: 'Review submitted successfully.', review });
   } catch (err) {
@@ -1342,14 +1371,19 @@ app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
       const senderName = sender?.fullName || 'Someone';
       const notificationBody = req.body.text ? req.body.text : '📎 Sent an attachment';
 
-      for (const recipientId of recipients) {
-        sendMessageNotification(
-          recipientId,
-          senderName,
-          notificationBody,
-          conversation._id.toString()
-        );
-      }
+      // ✅ FIX: await the fan-out instead of firing it after the loop and
+      // walking straight into res.json(). Same serverless-freeze risk as
+      // the application/review notifications above.
+      await Promise.allSettled(
+        recipients.map((recipientId) =>
+          sendMessageNotification(
+            recipientId,
+            senderName,
+            notificationBody,
+            conversation._id.toString()
+          )
+        )
+      );
 
       res.status(201).json({ message });
     } catch (error) {
