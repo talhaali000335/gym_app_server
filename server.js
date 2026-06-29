@@ -1224,18 +1224,53 @@ app.get('/api/users/:id', async (req, res) => {
   }
 });
 
+// ──────────────────────────────────────────────────────────────────────────────
+// ✅ FIXED CONTACTS ENDPOINT — only returns users you have an application link with
+// ──────────────────────────────────────────────────────────────────────────────
 app.get('/api/contacts', authenticate, async (req, res) => {
   try {
-    const currentUser = await User.findById(req.user.userId);
+    const userId = req.user.userId;
+    const currentUser = await User.findById(userId);
     if (!currentUser) return res.status(404).json({ message: 'User not found' });
 
-    const oppositeRole = currentUser.role === 'Practitioner' ? 'Business' : 'Practitioner';
-    const contacts = await User.find({ role: oppositeRole })
+    let contactIds = [];
+
+    if (currentUser.role === 'Practitioner') {
+      // Get all applications by this practitioner, populate job and its poster
+      const applications = await Application.find({ applicant: userId }).populate({
+        path: 'job',
+        populate: { path: 'postedBy', select: '_id' }
+      });
+      const businessIds = new Set();
+      applications.forEach(app => {
+        if (app.job && app.job.postedBy) {
+          businessIds.add(app.job.postedBy._id.toString());
+        }
+      });
+      contactIds = Array.from(businessIds);
+    } else if (currentUser.role === 'Business') {
+      // Get all jobs posted by this business
+      const jobs = await Job.find({ postedBy: userId }).select('_id');
+      const jobIds = jobs.map(j => j._id);
+      // Find applicants for those jobs
+      const applications = await Application.find({ job: { $in: jobIds } }).select('applicant');
+      const practitionerIds = new Set();
+      applications.forEach(app => {
+        practitionerIds.add(app.applicant.toString());
+      });
+      contactIds = Array.from(practitionerIds);
+    } else {
+      contactIds = [];
+    }
+
+    // Fetch user details for these IDs
+    const contacts = await User.find({ _id: { $in: contactIds } })
       .select('fullName profilePhoto role')
       .sort({ fullName: 1 });
 
     res.json({ contacts });
   } catch (err) {
+    console.error('Contacts error:', err);
     res.status(500).json({ message: err.message });
   }
 });
