@@ -612,7 +612,6 @@ app.post('/api/auth/google', async (req, res) => {
     const { idToken } = req.body;
     if (!idToken) return res.status(400).json({ message: 'idToken required' });
 
-    // Verify Google token via public endpoint
     const response = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${idToken}`);
     if (!response.ok) {
       return res.status(401).json({ message: 'Invalid Google token' });
@@ -717,13 +716,7 @@ app.post('/api/auth/x', async (req, res) => {
 
     const twitterId = data.data.id;
     const name = data.data.name || 'Twitter User';
-    // Twitter v2 doesn't return email by default; fallback to a placeholder
     const email = `${twitterId}@twitter.com`;
-
-    // Optional: request email with user:email scope – if your token has that scope:
-    // const emailResponse = await fetch('https://api.twitter.com/2/users/me?user.fields=email', { headers: { Authorization: `Bearer ${accessToken}` } });
-    // const emailData = await emailResponse.json();
-    // const email = emailData.data?.email || `${twitterId}@twitter.com`;
 
     let user = await User.findOne({ email });
     if (!user) {
@@ -752,7 +745,7 @@ app.post('/api/auth/x', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  PROFILE & OTHER ROUTES (unchanged)
+//  PROFILE & OTHER ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/api/profile', authenticate, async (req, res) => {
@@ -779,10 +772,11 @@ app.put('/api/users/me/token', authenticate, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  PROFILE SETUP ROUTES (location, qualifications, portfolio, verification, etc.)
+//  PROFILE SETUP ROUTES (location, qualifications, portfolio, verification)
 // ══════════════════════════════════════════════════════════════════════════════
 
-app.put('/api/profile/location', onboardingAuth, async (req, res) => {
+// ✅ FIXED: now uses `authenticate` instead of `onboardingAuth`
+app.put('/api/profile/location', authenticate, async (req, res) => {
   try {
     const { location, latitude, longitude } = req.body;
     const id = req.user.userId;
@@ -797,6 +791,7 @@ app.put('/api/profile/location', onboardingAuth, async (req, res) => {
     if (!user) return res.status(404).json({ message: 'User not found.' });
     res.json({ message: 'Location updated', user });
   } catch (err) {
+    console.error('Location update error:', err);
     res.status(500).json({ message: err.message });
   }
 });
