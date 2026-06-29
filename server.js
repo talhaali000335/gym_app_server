@@ -225,7 +225,6 @@ const jobSchema = new mongoose.Schema(
     maxClients:       { type: Number, default: null },
     coverTime:        { type: String, default: '' },
     postedBy:         { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-    // ── NEW: Availability & Slots ──────────────────────────────────
     maxSlots:              { type: Number, default: 16 },
     filledSlots:           { type: Number, default: 0 },
     availabilityCalendar:  [availabilitySlotSchema],
@@ -235,7 +234,6 @@ const jobSchema = new mongoose.Schema(
 
 const Job = mongoose.model('Job', jobSchema);
 
-// ✅ Updated applicationSchema with `status` field
 const applicationSchema = new mongoose.Schema(
   {
     job:         { type: mongoose.Schema.Types.ObjectId, ref: 'Job',  required: true },
@@ -307,7 +305,6 @@ const messageSchema = new mongoose.Schema(
 messageSchema.index({ conversation: 1, createdAt: -1 });
 const Message = mongoose.model('Message', messageSchema);
 
-// ── NEW: Review Schema ─────────────────────────────────────────────────────────
 const reviewSchema = new mongoose.Schema(
   {
     reviewer: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
@@ -375,11 +372,9 @@ const isParticipant = (conversation, userId) =>
   conversation.participants.map(String).includes(String(userId));
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  PUSH NOTIFICATIONS  (drop-in replacement for the entire notification section)
-//  Paste this over the old sendPushNotification + convenience functions.
+//  PUSH NOTIFICATIONS
 // ══════════════════════════════════════════════════════════════════════════════
 
-// ── Channel map (type → Flutter channel id) ────────────────────────────────
 const TYPE_TO_CHANNEL = {
   new_message:     'covrly_messages',
   message:         'covrly_messages',
@@ -390,7 +385,6 @@ const TYPE_TO_CHANNEL = {
   review:          'covrly_reviews',
 };
 
-// ── Core send ──────────────────────────────────────────────────────────────
 const sendPushNotification = async (userId, title, body, data = {}) => {
   try {
     if (!admin.apps || admin.apps.length === 0) return;
@@ -411,9 +405,9 @@ const sendPushNotification = async (userId, title, body, data = {}) => {
       token: user.fcmToken,
       notification: { title: String(title), body: String(body) },
       android: {
-        priority: 'high',                        // wakes device from Doze (Android 9)
+        priority: 'high',
         notification: {
-          channelId,                             // ✅ correct channel per type
+          channelId,
           sound:                 'default',
           defaultVibrateTimings: true,
           notificationPriority:  'PRIORITY_HIGH',
@@ -427,7 +421,6 @@ const sendPushNotification = async (userId, title, body, data = {}) => {
     const response = await admin.messaging().send(message);
     console.log(`📲 Push [${type}] → user ${userId}: ${response}`);
     return response;
-
   } catch (error) {
     console.error(`❌ FCM error [${data.type}] user ${userId}:`, error.code, error.message);
     if (
@@ -440,7 +433,6 @@ const sendPushNotification = async (userId, title, body, data = {}) => {
   }
 };
 
-// ── Convenience wrappers ───────────────────────────────────────────────────
 const sendMessageNotification = (recipientId, senderName, text, conversationId) =>
   sendPushNotification(
     recipientId,
@@ -481,16 +473,10 @@ const sendReviewNotification = (businessId, reviewerName, rating) =>
     { type: 'review', rating }
   );
 
-// ══════════════════════════════════════════════════════════════════════════════
-//  TEST ENDPOINT  — hit this from Postman/browser to confirm FCM works end-to-end
-//  DELETE this route before going to production.
-//  Usage: POST /api/test-push  { "userId": "...", "title": "Hello", "body": "World" }
-// ══════════════════════════════════════════════════════════════════════════════
+// ── Test push endpoint ─────────────────────────────────────────────────────────
 app.post('/api/test-push', async (req, res) => {
   try {
     const { userId, title = 'Test', body = 'Push is working! 🎉', token } = req.body;
-
-    // Direct token test (no DB lookup)
     if (token) {
       if (!admin.apps || admin.apps.length === 0) {
         return res.status(500).json({ message: 'Firebase Admin not initialised' });
@@ -514,14 +500,11 @@ app.post('/api/test-push', async (req, res) => {
       const response = await admin.messaging().send(message);
       return res.json({ success: true, response });
     }
-
-    // User-ID based test (DB lookup)
     if (!userId) {
       return res.status(400).json({ message: 'Provide userId or token' });
     }
     await sendPushNotification(userId, title, body, { type: 'test' });
     res.json({ success: true, message: `Notification sent to user ${userId}` });
-
   } catch (err) {
     console.error('Test push error:', err);
     res.status(500).json({ message: err.message });
@@ -619,6 +602,159 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+//  SOCIAL AUTH ROUTES  (Google, Facebook, X)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Google Sign-In
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const { idToken } = req.body;
+    if (!idToken) return res.status(400).json({ message: 'idToken required' });
+
+    // Verify Google token via public endpoint
+    const response = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${idToken}`);
+    if (!response.ok) {
+      return res.status(401).json({ message: 'Invalid Google token' });
+    }
+    const payload = await response.json();
+    const { email, name, picture } = payload;
+
+    if (!email) {
+      return res.status(401).json({ message: 'Email not provided by Google' });
+    }
+
+    let user = await User.findOne({ email });
+    if (!user) {
+      user = new User({
+        fullName: name || email.split('@')[0],
+        email,
+        phone: '',
+        password: await bcrypt.hash(Math.random().toString(36), 10),
+        profilePhoto: picture || null,
+        role: 'Practitioner',
+      });
+      await user.save();
+    }
+
+    const token = jwt.sign(
+      { userId: user._id, email: user.email, role: user.role, fullName: user.fullName },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    res.json({ token, user: user.toJSON() });
+  } catch (err) {
+    console.error('Google auth error:', err);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// Facebook (Meta) Sign-In
+app.post('/api/auth/facebook', async (req, res) => {
+  try {
+    const { accessToken } = req.body;
+    if (!accessToken) return res.status(400).json({ message: 'accessToken required' });
+
+    const fbResponse = await fetch(
+      `https://graph.facebook.com/me?access_token=${accessToken}&fields=id,name,email,picture`
+    );
+    if (!fbResponse.ok) {
+      return res.status(401).json({ message: 'Invalid Facebook token' });
+    }
+    const data = await fbResponse.json();
+
+    if (!data.email) {
+      return res.status(401).json({ message: 'Email not provided by Facebook' });
+    }
+
+    const { email, name, picture } = data;
+    let user = await User.findOne({ email });
+    if (!user) {
+      user = new User({
+        fullName: name || email.split('@')[0],
+        email,
+        phone: '',
+        password: await bcrypt.hash(Math.random().toString(36), 10),
+        profilePhoto: picture?.data?.url || null,
+        role: 'Practitioner',
+      });
+      await user.save();
+    }
+
+    const token = jwt.sign(
+      { userId: user._id, email: user.email, role: user.role, fullName: user.fullName },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    res.json({ token, user: user.toJSON() });
+  } catch (err) {
+    console.error('Facebook auth error:', err);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// X (Twitter) Sign-In
+app.post('/api/auth/x', async (req, res) => {
+  try {
+    const { accessToken } = req.body;
+    if (!accessToken) return res.status(400).json({ message: 'accessToken required' });
+
+    const twitterResponse = await fetch('https://api.twitter.com/2/users/me', {
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+      },
+    });
+    if (!twitterResponse.ok) {
+      return res.status(401).json({ message: 'Invalid Twitter token' });
+    }
+    const data = await twitterResponse.json();
+
+    if (!data.data) {
+      return res.status(401).json({ message: 'Invalid Twitter response' });
+    }
+
+    const twitterId = data.data.id;
+    const name = data.data.name || 'Twitter User';
+    // Twitter v2 doesn't return email by default; fallback to a placeholder
+    const email = `${twitterId}@twitter.com`;
+
+    // Optional: request email with user:email scope – if your token has that scope:
+    // const emailResponse = await fetch('https://api.twitter.com/2/users/me?user.fields=email', { headers: { Authorization: `Bearer ${accessToken}` } });
+    // const emailData = await emailResponse.json();
+    // const email = emailData.data?.email || `${twitterId}@twitter.com`;
+
+    let user = await User.findOne({ email });
+    if (!user) {
+      user = new User({
+        fullName: name,
+        email,
+        phone: '',
+        password: await bcrypt.hash(Math.random().toString(36), 10),
+        profilePhoto: null,
+        role: 'Practitioner',
+      });
+      await user.save();
+    }
+
+    const token = jwt.sign(
+      { userId: user._id, email: user.email, role: user.role, fullName: user.fullName },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    res.json({ token, user: user.toJSON() });
+  } catch (err) {
+    console.error('Twitter auth error:', err);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  PROFILE & OTHER ROUTES (unchanged)
+// ══════════════════════════════════════════════════════════════════════════════
+
 app.get('/api/profile', authenticate, async (req, res) => {
   try {
     const user = await User.findById(req.user.userId);
@@ -629,12 +765,11 @@ app.get('/api/profile', authenticate, async (req, res) => {
   }
 });
 
-// ── FCM token update ───────────────────────────────────────────────────────────
+// ── FCM token update ──────────────────────────────────────────────────────────
 app.put('/api/users/me/token', authenticate, async (req, res) => {
   try {
     const { fcmToken } = req.body;
     if (!fcmToken) return res.status(400).json({ message: 'fcmToken is required.' });
-
     await User.findByIdAndUpdate(req.user.userId, { fcmToken });
     console.log(`📱 FCM token updated for user ${req.user.userId}`);
     res.json({ success: true });
@@ -644,7 +779,7 @@ app.put('/api/users/me/token', authenticate, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  PROFILE SETUP ROUTES
+//  PROFILE SETUP ROUTES (location, qualifications, portfolio, verification, etc.)
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.put('/api/profile/location', onboardingAuth, async (req, res) => {
@@ -677,7 +812,7 @@ app.post('/api/profile/qualifications', onboardingAuth, (req, res) => {
       let documentUrl      = '';
       let documentPublicId = '';
       if (req.file) {
-        const result     = await uploadToCloudinary(req.file.buffer, 'qualifications');
+        const result = await uploadToCloudinary(req.file.buffer, 'qualifications');
         documentUrl      = result.secure_url;
         documentPublicId = result.public_id;
       }
@@ -817,7 +952,7 @@ app.put('/api/profile', authenticate, upload.single('profilePhoto'), async (req,
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  JOB ROUTES
+//  JOB ROUTES (unchanged)
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/api/jobs', async (req, res) => {
@@ -878,14 +1013,6 @@ app.post('/api/jobs', authenticate, async (req, res) => {
       postedBy: req.user.userId,
     });
 
-    // ✅ FIX: this was a bare fire-and-forget .then() chain. Same problem as
-    // the application/review routes — on a serverless host (Vercel) the
-    // function can be frozen the instant res.json() below is sent, so an
-    // un-awaited batch can be cut short or skipped entirely. Awaiting it
-    // trades a bit of response latency for actually guaranteeing delivery.
-    // If this fan-out grows large enough that the delay becomes a problem,
-    // look at your platform's "keep function alive after response" hook
-    // (e.g. Vercel's `waitUntil`) instead of going back to fire-and-forget.
     try {
       const practitioners = await User.find({ role: 'Practitioner', fcmToken: { $ne: null } })
         .select('_id')
@@ -914,32 +1041,26 @@ app.post('/api/jobs', authenticate, async (req, res) => {
   }
 });
 
-// ── Update Job Availability (Business only) ────────────────────────────────────
 app.put('/api/jobs/:id/availability', authenticate, async (req, res) => {
   try {
     if (req.user.role !== 'Business') {
       return res.status(403).json({ message: 'Only Business accounts can update availability.' });
     }
-
     const { availabilityCalendar } = req.body;
     const job = await Job.findOne({ _id: req.params.id, postedBy: req.user.userId });
     if (!job) return res.status(404).json({ message: 'Job not found or not owned by you.' });
-
     job.availabilityCalendar = availabilityCalendar || [];
     await job.save();
-
     res.json({ message: 'Availability updated.', job });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 });
 
-// ── Get Job Availability ─────────────────────────────────────────────────────
 app.get('/api/jobs/:id/availability', async (req, res) => {
   try {
     const job = await Job.findById(req.params.id).select('availabilityCalendar maxSlots filledSlots title company');
     if (!job) return res.status(404).json({ message: 'Job not found.' });
-
     const availableSlots = job.maxSlots - job.filledSlots;
     res.json({
       calendar: job.availabilityCalendar || [],
@@ -953,14 +1074,12 @@ app.get('/api/jobs/:id/availability', async (req, res) => {
   }
 });
 
-// ── Apply for Job (with slot management) ─────────────────────────────────────
 app.post('/api/jobs/:id/apply', authenticate, (req, res) => {
   uploadAppDocs(req, res, async (err) => {
     if (err) return res.status(400).json({ message: err.message });
     try {
       const job = await Job.findById(req.params.id);
       if (!job) return res.status(404).json({ message: 'Job not found.' });
-
       if (job.filledSlots >= job.maxSlots) {
         return res.status(400).json({ message: 'This job is no longer accepting applications. All slots are filled.' });
       }
@@ -986,7 +1105,6 @@ app.post('/api/jobs/:id/apply', authenticate, (req, res) => {
         fullName, email, phone,
         coverLetter: coverLetter || '',
         documents,
-        // status defaults to 'applied'
       });
 
       job.filledSlots += 1;
@@ -994,15 +1112,6 @@ app.post('/api/jobs/:id/apply', authenticate, (req, res) => {
 
       console.log(`📨 New application for "${job.title}" by ${email}. Slots: ${job.filledSlots}/${job.maxSlots}`);
 
-      // ✅ FIX: this used to be a bare, un-awaited call. On a serverless
-      // host (Vercel — see module.exports at the bottom of this file) the
-      // function's execution context can be frozen the instant res.json()
-      // below returns, which can kill this notification before
-      // admin.messaging().send() ever actually fires. Awaiting it here
-      // guarantees the push is sent (or fails loudly in the console)
-      // before we respond. sendPushNotification() already catches its own
-      // errors internally, so this can never reject and will not turn a
-      // notification failure into a 500 for the applicant.
       await sendApplicationNotification(
         job.postedBy,
         fullName,
@@ -1043,7 +1152,6 @@ app.get('/api/applications/me', authenticate, async (req, res) => {
   }
 });
 
-// ✅ NEW: Withdraw Application
 app.patch('/api/applications/:id/withdraw', authenticate, async (req, res) => {
   try {
     const app = await Application.findOneAndUpdate(
@@ -1059,7 +1167,7 @@ app.patch('/api/applications/:id/withdraw', authenticate, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  REVIEW ROUTES
+//  REVIEW ROUTES (unchanged)
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/api/reviews', authenticate, async (req, res) => {
@@ -1067,7 +1175,6 @@ app.post('/api/reviews', authenticate, async (req, res) => {
     if (req.user.role !== 'Practitioner') {
       return res.status(403).json({ message: 'Only Practitioners can submit reviews.' });
     }
-
     const { businessId, jobId, rating, comment } = req.body;
     if (!businessId || !rating || !comment) {
       return res.status(400).json({ message: 'businessId, rating, and comment are required.' });
@@ -1099,21 +1206,10 @@ app.post('/api/reviews', authenticate, async (req, res) => {
       comment,
     });
 
-    // ✅ FIX: req.user.fullName never existed. The JWT payload signed in
-    // /api/login and /api/register/complete only carried
-    // { userId, email, role }, so req.user.fullName was always undefined
-    // and every review notification silently fell back to "Someone". Look
-    // the reviewer's real name up instead. (We've also added fullName to
-    // newly-issued JWTs above so this lookup becomes unnecessary going
-    // forward, but the DB lookup is kept here so it keeps working for
-    // anyone still holding an old token that doesn't have it.)
     const reviewer = req.user.fullName
       ? { fullName: req.user.fullName }
       : await User.findById(req.user.userId).select('fullName');
 
-    // ✅ FIX: await this for the same reason as the application
-    // notification above — un-awaited async work after the DB write but
-    // before res.json() is not guaranteed to finish on a serverless host.
     await sendReviewNotification(businessId, reviewer?.fullName || 'Someone', rating);
 
     res.status(201).json({ message: 'Review submitted successfully.', review });
@@ -1202,7 +1298,7 @@ app.delete('/api/reviews/:id', authenticate, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  USER ROUTES
+//  USER ROUTES (unchanged)
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/api/users', async (_req, res) => {
@@ -1224,9 +1320,6 @@ app.get('/api/users/:id', async (req, res) => {
   }
 });
 
-// ──────────────────────────────────────────────────────────────────────────────
-// ✅ FIXED CONTACTS ENDPOINT — only returns users you have an application link with
-// ──────────────────────────────────────────────────────────────────────────────
 app.get('/api/contacts', authenticate, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -1236,7 +1329,6 @@ app.get('/api/contacts', authenticate, async (req, res) => {
     let contactIds = [];
 
     if (currentUser.role === 'Practitioner') {
-      // Get all applications by this practitioner, populate job and its poster
       const applications = await Application.find({ applicant: userId }).populate({
         path: 'job',
         populate: { path: 'postedBy', select: '_id' }
@@ -1249,10 +1341,8 @@ app.get('/api/contacts', authenticate, async (req, res) => {
       });
       contactIds = Array.from(businessIds);
     } else if (currentUser.role === 'Business') {
-      // Get all jobs posted by this business
       const jobs = await Job.find({ postedBy: userId }).select('_id');
       const jobIds = jobs.map(j => j._id);
-      // Find applicants for those jobs
       const applications = await Application.find({ job: { $in: jobIds } }).select('applicant');
       const practitionerIds = new Set();
       applications.forEach(app => {
@@ -1263,7 +1353,6 @@ app.get('/api/contacts', authenticate, async (req, res) => {
       contactIds = [];
     }
 
-    // Fetch user details for these IDs
     const contacts = await User.find({ _id: { $in: contactIds } })
       .select('fullName profilePhoto role')
       .sort({ fullName: 1 });
@@ -1276,7 +1365,7 @@ app.get('/api/contacts', authenticate, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  CHAT ROUTES
+//  CHAT ROUTES (unchanged)
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/api/conversations', authenticate, async (req, res) => {
@@ -1402,7 +1491,7 @@ app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
         messageData.messageType = 'text';
         messageData.content     = req.body.text;
       } else if (req.file) {
-        const result            = await uploadToCloudinary(req.file.buffer, 'chat_files', 'auto');
+        const result = await uploadToCloudinary(req.file.buffer, 'chat_files', 'auto');
         messageData.messageType = getMessageType(req.file.mimetype);
         messageData.content     = result.secure_url;
         messageData.fileName    = req.file.originalname;
@@ -1416,7 +1505,6 @@ app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
       conversation.lastMessage = message._id;
       await conversation.save();
 
-      // Send push notification to recipients
       const recipients = conversation.participants.filter(
         (p) => p.toString() !== req.user.userId.toString()
       );
@@ -1424,9 +1512,6 @@ app.post('/api/conversations/:id/messages', authenticate, (req, res) => {
       const senderName = sender?.fullName || 'Someone';
       const notificationBody = req.body.text ? req.body.text : '📎 Sent an attachment';
 
-      // ✅ FIX: await the fan-out instead of firing it after the loop and
-      // walking straight into res.json(). Same serverless-freeze risk as
-      // the application/review notifications above.
       await Promise.allSettled(
         recipients.map((recipientId) =>
           sendMessageNotification(
