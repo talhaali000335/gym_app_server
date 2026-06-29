@@ -235,6 +235,7 @@ const jobSchema = new mongoose.Schema(
 
 const Job = mongoose.model('Job', jobSchema);
 
+// ✅ Updated applicationSchema with `status` field
 const applicationSchema = new mongoose.Schema(
   {
     job:         { type: mongoose.Schema.Types.ObjectId, ref: 'Job',  required: true },
@@ -243,6 +244,7 @@ const applicationSchema = new mongoose.Schema(
     email:       { type: String, required: true },
     phone:       { type: String, required: true },
     coverLetter: { type: String, default: '' },
+    status:      { type: String, enum: ['applied', 'withdrawn', 'rejected'], default: 'applied' },
     documents:   [{
       originalName: String,
       url:          String,
@@ -984,6 +986,7 @@ app.post('/api/jobs/:id/apply', authenticate, (req, res) => {
         fullName, email, phone,
         coverLetter: coverLetter || '',
         documents,
+        // status defaults to 'applied'
       });
 
       job.filledSlots += 1;
@@ -1035,6 +1038,21 @@ app.get('/api/applications/me', authenticate, async (req, res) => {
     }));
 
     res.json({ count: enriched.length, applications: enriched });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ✅ NEW: Withdraw Application
+app.patch('/api/applications/:id/withdraw', authenticate, async (req, res) => {
+  try {
+    const app = await Application.findOneAndUpdate(
+      { _id: req.params.id, applicant: req.user.userId },
+      { status: 'withdrawn' },
+      { new: true }
+    );
+    if (!app) return res.status(404).json({ message: 'Application not found' });
+    res.json({ message: 'Application withdrawn', application: app });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
