@@ -9,7 +9,7 @@ const multer     = require('multer');
 const path       = require('path');
 const cloudinary = require('cloudinary').v2;
 const admin      = require('firebase-admin');
-const nodemailer = require('nodemailer');               // ✅ new
+const nodemailer = require('nodemailer');
 
 const app = express();
 
@@ -208,6 +208,10 @@ const userSchema = new mongoose.Schema(
       remindDaysBefore:  { type: Number,  default: 15 },
     },
     fcmToken: { type: String, default: null },
+    // ✅ NEW: Security & verification fields
+    twoFactorEnabled: { type: Boolean, default: false },
+    emailVerified:    { type: Boolean, default: false },
+    phoneVerified:    { type: Boolean, default: false },
   },
   { timestamps: true }
 );
@@ -763,7 +767,7 @@ app.post('/api/auth/x', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  FORGOT / RESET PASSWORD  (NEW – real email sending)
+//  FORGOT / RESET PASSWORD  (real email sending)
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/api/forgot-password', async (req, res) => {
@@ -885,7 +889,7 @@ app.put('/api/users/me/token', authenticate, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  PROFILE SETUP ROUTES (location, qualifications, portfolio, verification)
+//  PROFILE SETUP ROUTES (location, qualifications, portfolio, verification, security)
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.put('/api/profile/location', authenticate, async (req, res) => {
@@ -1013,6 +1017,25 @@ app.put('/api/profile/verification', onboardingAuth, async (req, res) => {
     const user = await User.findByIdAndUpdate(req.user.userId, { $set: settings }, { new: true });
     if (!user) return res.status(404).json({ message: 'User not found.' });
     res.json({ message: 'Verification settings updated', user });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ✅ NEW: Security settings (2FA toggle) for Practitioners only
+app.put('/api/profile/security', authenticate, async (req, res) => {
+  try {
+    if (req.user.role !== 'Practitioner') {
+      return res.status(403).json({ message: 'Only practitioners can access this.' });
+    }
+
+    const { twoFactorEnabled } = req.body;
+    const update = {};
+    if (typeof twoFactorEnabled === 'boolean') update.twoFactorEnabled = twoFactorEnabled;
+
+    const user = await User.findByIdAndUpdate(req.user.userId, { $set: update }, { new: true });
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+    res.json({ message: 'Security settings updated', user: user.toJSON() });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
