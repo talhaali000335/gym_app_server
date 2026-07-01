@@ -794,13 +794,14 @@ app.post('/api/forgot-password', async (req, res) => {
           to: email,
           subject: 'Covrly – Password Reset',
           html: `
-            <p>Hello,</p>
-            <p>We received a request to reset your Covrly password. Click the link below to set a new password:</p>
-            <p><a href="${resetUrl}">${resetUrl}</a></p>
-            <p>This link will expire in 15 minutes.</p>
-            <p>If you didn’t request this, you can safely ignore this email.</p>
-            <p>– The Covrly Team</p>
-          `,
+           <p>Hello,</p>
+          <p>We received a request to reset your Covrly password.</p>
+          <p>To reset your password, open the Covrly app, go to <strong>Reset Password</strong> and paste the following token:</p>
+          <p style="font-size:18px;background:#f0f0f0;padding:10px;border-radius:4px;word-break:break-all;">${token}</p>
+          <p>This token will expire in <strong>15 minutes</strong>.</p>
+          <p>If you didn’t request this, you can safely ignore this email.</p>
+          <p>– The Covrly Team</p>
+             `,
         });
         console.log(`📧 Password reset email sent to ${email}`);
       } catch (emailErr) {
