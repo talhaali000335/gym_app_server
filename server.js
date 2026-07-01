@@ -208,7 +208,7 @@ const userSchema = new mongoose.Schema(
       remindDaysBefore:  { type: Number,  default: 15 },
     },
     fcmToken: { type: String, default: null },
-    // ✅ NEW: Security & verification fields
+    // Security & verification fields (accessible to both roles)
     twoFactorEnabled: { type: Boolean, default: false },
     emailVerified:    { type: Boolean, default: false },
     phoneVerified:    { type: Boolean, default: false },
@@ -1022,13 +1022,10 @@ app.put('/api/profile/verification', onboardingAuth, async (req, res) => {
   }
 });
 
-// ✅ NEW: Security settings (2FA toggle) for Practitioners only
+// ✅ FIXED: Security settings (2FA toggle) – now allowed for both roles
 app.put('/api/profile/security', authenticate, async (req, res) => {
   try {
-    if (req.user.role !== 'Practitioner') {
-      return res.status(403).json({ message: 'Only practitioners can access this.' });
-    }
-
+    // ❌ Removed the role check – any authenticated user can update security settings
     const { twoFactorEnabled } = req.body;
     const update = {};
     if (typeof twoFactorEnabled === 'boolean') update.twoFactorEnabled = twoFactorEnabled;
