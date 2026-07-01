@@ -212,7 +212,11 @@ const userSchema = new mongoose.Schema(
     emailVerified:    { type: Boolean, default: false },
     phoneVerified:    { type: Boolean, default: false },
 
-    // ✅ NEW: Privacy settings
+    // 2FA OTP fields
+    twoFactorCode:        { type: String, default: null },
+    twoFactorCodeExpires: { type: Date,   default: null },
+
+    // Privacy settings
     privacySettings: {
       profileVisibility:   { type: String, enum: ['public', 'contacts'], default: 'public' },
       showEmailToContacts: { type: Boolean, default: true },
@@ -225,6 +229,8 @@ const userSchema = new mongoose.Schema(
 userSchema.set('toJSON', {
   transform(_doc, ret) {
     delete ret.password;
+    delete ret.twoFactorCode;        // never leak OTP
+    delete ret.twoFactorCodeExpires;
     return ret;
   },
 });
@@ -605,6 +611,7 @@ app.post('/api/register/complete', async (req, res) => {
   }
 });
 
+// ✅ UPDATED: Login with 2FA support
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -616,6 +623,46 @@ app.post('/api/login', async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(401).json({ message: 'Invalid email or password.' });
 
+    // ── 2FA check ────────────────────────────────────────────────
+    if (user.twoFactorEnabled) {
+      const otp = Math.floor(100000 + Math.random() * 900000).toString();
+      user.twoFactorCode = otp;
+      user.twoFactorCodeExpires = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
+      await user.save();
+
+      if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+        try {
+          await transporter.sendMail({
+            from: process.env.EMAIL_USER,
+            to: user.email,
+            subject: 'Covrly – Your 2FA Code',
+            html: `<p>Your 2‑factor authentication code is:</p>
+                   <h2 style="text-align:center;letter-spacing:6px;">${otp}</h2>
+                   <p>This code expires in 5 minutes.</p>`,
+          });
+          console.log(`📧 2FA code sent to ${user.email}`);
+        } catch (emailErr) {
+          console.error('2FA email error:', emailErr.message);
+          console.log(`🔑 2FA code for ${user.email}: ${otp}`);
+        }
+      } else {
+        console.log(`🔑 2FA code for ${user.email}: ${otp}`);
+      }
+
+      const tempToken = jwt.sign(
+        { userId: user._id, purpose: '2fa_verification' },
+        process.env.JWT_SECRET,
+        { expiresIn: '5m' }
+      );
+
+      return res.status(200).json({
+        requires2FA: true,
+        tempToken,
+        message: 'A verification code has been sent to your email.',
+      });
+    }
+
+    // No 2FA – normal login
     const token = jwt.sign(
       { userId: user._id, email: user.email, role: user.role, fullName: user.fullName },
       process.env.JWT_SECRET,
@@ -627,6 +674,52 @@ app.post('/api/login', async (req, res) => {
   } catch (err) {
     console.error('Login error:', err);
     res.status(500).json({ message: 'Server error. Please try again.' });
+  }
+});
+
+// ✅ NEW: 2FA verification endpoint
+app.post('/api/verify-2fa', async (req, res) => {
+  try {
+    const { tempToken, code } = req.body;
+    if (!tempToken || !code)
+      return res.status(400).json({ message: 'Temporary token and code are required.' });
+
+    let decoded;
+    try {
+      decoded = jwt.verify(tempToken, process.env.JWT_SECRET);
+    } catch (err) {
+      return res.status(401).json({ message: 'Invalid or expired verification session.' });
+    }
+
+    if (decoded.purpose !== '2fa_verification') {
+      return res.status(401).json({ message: 'Invalid token purpose.' });
+    }
+
+    const user = await User.findById(decoded.userId);
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+
+    if (!user.twoFactorCode ||
+        user.twoFactorCode !== code ||
+        user.twoFactorCodeExpires < new Date()) {
+      return res.status(400).json({ message: 'Invalid or expired code.' });
+    }
+
+    // Clear OTP
+    user.twoFactorCode = null;
+    user.twoFactorCodeExpires = null;
+    await user.save();
+
+    // Issue final JWT
+    const token = jwt.sign(
+      { userId: user._id, email: user.email, role: user.role, fullName: user.fullName },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    res.status(200).json({ message: 'Verification successful', token, user: user.toJSON() });
+  } catch (err) {
+    console.error('Verify 2FA error:', err);
+    res.status(500).json({ message: 'Server error.' });
   }
 });
 
@@ -1027,7 +1120,7 @@ app.put('/api/profile/verification', onboardingAuth, async (req, res) => {
   }
 });
 
-// ✅ UPDATED: Security & Privacy endpoint – now accepts privacy settings too
+// ✅ UPDATED: Security & Privacy endpoint
 app.put('/api/profile/security', authenticate, async (req, res) => {
   try {
     const { twoFactorEnabled, privacySettings } = req.body;
@@ -1037,7 +1130,6 @@ app.put('/api/profile/security', authenticate, async (req, res) => {
       update.twoFactorEnabled = twoFactorEnabled;
     }
 
-    // Handle privacy settings
     if (privacySettings && typeof privacySettings === 'object') {
       if (privacySettings.profileVisibility) {
         update['privacySettings.profileVisibility'] = privacySettings.profileVisibility;
