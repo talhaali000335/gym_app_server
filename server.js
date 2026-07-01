@@ -9,6 +9,7 @@ const multer     = require('multer');
 const path       = require('path');
 const cloudinary = require('cloudinary').v2;
 const admin      = require('firebase-admin');
+const nodemailer = require('nodemailer');               // ✅ new
 
 const app = express();
 
@@ -47,6 +48,23 @@ cloudinary.config({
   api_key:    process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
+
+// ── Nodemailer transporter (real emails) ─────────────────────────────────────
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+});
+
+if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+  transporter.verify()
+    .then(() => console.log('📧 Email transporter is ready'))
+    .catch((err) => console.error('❌ Email transporter error:', err.message));
+} else {
+  console.warn('⚠️  EMAIL_USER / EMAIL_PASS not set – password reset emails will be logged to console only');
+}
 
 // ── Multer – memory storage ────────────────────────────────────────────────────
 const memoryStorage = multer.memoryStorage();
@@ -745,6 +763,100 @@ app.post('/api/auth/x', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
+//  FORGOT / RESET PASSWORD  (NEW – real email sending)
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.post('/api/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ message: 'Email is required.' });
+
+    const user = await User.findOne({ email: email.toLowerCase() });
+    if (!user) {
+      // Generic response to prevent email enumeration
+      return res.status(200).json({
+        message: 'If that email is registered, a reset link has been sent.',
+      });
+    }
+
+    const token = jwt.sign(
+      { userId: user._id, purpose: 'password_reset' },
+      process.env.JWT_SECRET,
+      { expiresIn: '15m' }
+    );
+
+    const resetUrl = `${process.env.CLIENT_URL || 'https://yourapp.com'}/reset-password?token=${token}`;
+
+    if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+      try {
+        await transporter.sendMail({
+          from: process.env.EMAIL_USER,
+          to: email,
+          subject: 'Covrly – Password Reset',
+          html: `
+            <p>Hello,</p>
+            <p>We received a request to reset your Covrly password. Click the link below to set a new password:</p>
+            <p><a href="${resetUrl}">${resetUrl}</a></p>
+            <p>This link will expire in 15 minutes.</p>
+            <p>If you didn’t request this, you can safely ignore this email.</p>
+            <p>– The Covrly Team</p>
+          `,
+        });
+        console.log(`📧 Password reset email sent to ${email}`);
+      } catch (emailErr) {
+        console.error('Failed to send email:', emailErr.message);
+        console.log(`🔑 Password reset token for ${email}: ${token}`);
+      }
+    } else {
+      console.log(`🔑 Password reset token for ${email}: ${token}`);
+      console.log(`   Reset link: ${resetUrl}`);
+    }
+
+    res.status(200).json({
+      message: 'If that email is registered, a reset link has been sent.',
+    });
+  } catch (err) {
+    console.error('Forgot password error:', err);
+    res.status(500).json({ message: 'Server error.' });
+  }
+});
+
+app.post('/api/reset-password', async (req, res) => {
+  try {
+    const { token, newPassword } = req.body;
+    if (!token || !newPassword) {
+      return res.status(400).json({ message: 'Token and new password are required.' });
+    }
+    if (newPassword.length < 6) {
+      return res.status(400).json({ message: 'Password must be at least 6 characters.' });
+    }
+
+    let decoded;
+    try {
+      decoded = jwt.verify(token, process.env.JWT_SECRET);
+    } catch (err) {
+      return res.status(401).json({ message: 'Invalid or expired token.' });
+    }
+
+    if (decoded.purpose !== 'password_reset') {
+      return res.status(401).json({ message: 'Invalid token purpose.' });
+    }
+
+    const user = await User.findById(decoded.userId);
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+
+    user.password = await bcrypt.hash(newPassword, 12);
+    await user.save();
+
+    console.log(`🔒 Password reset successful for ${user.email}`);
+    res.status(200).json({ message: 'Password has been reset successfully. You can now log in.' });
+  } catch (err) {
+    console.error('Reset password error:', err);
+    res.status(500).json({ message: 'Server error.' });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
 //  PROFILE & OTHER ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -775,7 +887,6 @@ app.put('/api/users/me/token', authenticate, async (req, res) => {
 //  PROFILE SETUP ROUTES (location, qualifications, portfolio, verification)
 // ══════════════════════════════════════════════════════════════════════════════
 
-// ✅ FIXED: now uses `authenticate` instead of `onboardingAuth`
 app.put('/api/profile/location', authenticate, async (req, res) => {
   try {
     const { location, latitude, longitude } = req.body;
@@ -947,7 +1058,7 @@ app.put('/api/profile', authenticate, upload.single('profilePhoto'), async (req,
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  JOB ROUTES (unchanged)
+//  JOB ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/api/jobs', async (req, res) => {
@@ -1162,7 +1273,7 @@ app.patch('/api/applications/:id/withdraw', authenticate, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  REVIEW ROUTES (unchanged)
+//  REVIEW ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/api/reviews', authenticate, async (req, res) => {
@@ -1293,7 +1404,7 @@ app.delete('/api/reviews/:id', authenticate, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  USER ROUTES (unchanged)
+//  USER ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/api/users', async (_req, res) => {
@@ -1360,7 +1471,7 @@ app.get('/api/contacts', authenticate, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  CHAT ROUTES (unchanged)
+//  CHAT ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/api/conversations', authenticate, async (req, res) => {
