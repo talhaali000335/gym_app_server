@@ -208,10 +208,16 @@ const userSchema = new mongoose.Schema(
       remindDaysBefore:  { type: Number,  default: 15 },
     },
     fcmToken: { type: String, default: null },
-    // Security & verification fields (accessible to both roles)
     twoFactorEnabled: { type: Boolean, default: false },
     emailVerified:    { type: Boolean, default: false },
     phoneVerified:    { type: Boolean, default: false },
+
+    // ✅ NEW: Privacy settings
+    privacySettings: {
+      profileVisibility:   { type: String, enum: ['public', 'contacts'], default: 'public' },
+      showEmailToContacts: { type: Boolean, default: true },
+      showPhoneToContacts: { type: Boolean, default: true },
+    },
   },
   { timestamps: true }
 );
@@ -777,7 +783,6 @@ app.post('/api/forgot-password', async (req, res) => {
 
     const user = await User.findOne({ email: email.toLowerCase() });
     if (!user) {
-      // Generic response to prevent email enumeration
       return res.status(200).json({
         message: 'If that email is registered, a reset link has been sent.',
       });
@@ -1022,17 +1027,36 @@ app.put('/api/profile/verification', onboardingAuth, async (req, res) => {
   }
 });
 
-// ✅ FIXED: Security settings (2FA toggle) – now allowed for both roles
+// ✅ UPDATED: Security & Privacy endpoint – now accepts privacy settings too
 app.put('/api/profile/security', authenticate, async (req, res) => {
   try {
-    // ❌ Removed the role check – any authenticated user can update security settings
-    const { twoFactorEnabled } = req.body;
+    const { twoFactorEnabled, privacySettings } = req.body;
     const update = {};
-    if (typeof twoFactorEnabled === 'boolean') update.twoFactorEnabled = twoFactorEnabled;
+
+    if (typeof twoFactorEnabled === 'boolean') {
+      update.twoFactorEnabled = twoFactorEnabled;
+    }
+
+    // Handle privacy settings
+    if (privacySettings && typeof privacySettings === 'object') {
+      if (privacySettings.profileVisibility) {
+        update['privacySettings.profileVisibility'] = privacySettings.profileVisibility;
+      }
+      if (typeof privacySettings.showEmailToContacts === 'boolean') {
+        update['privacySettings.showEmailToContacts'] = privacySettings.showEmailToContacts;
+      }
+      if (typeof privacySettings.showPhoneToContacts === 'boolean') {
+        update['privacySettings.showPhoneToContacts'] = privacySettings.showPhoneToContacts;
+      }
+    }
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ message: 'No valid settings to update.' });
+    }
 
     const user = await User.findByIdAndUpdate(req.user.userId, { $set: update }, { new: true });
     if (!user) return res.status(404).json({ message: 'User not found.' });
-    res.json({ message: 'Security settings updated', user: user.toJSON() });
+    res.json({ message: 'Security & privacy settings updated', user: user.toJSON() });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
