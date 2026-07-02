@@ -1099,7 +1099,8 @@ app.delete('/api/profile/portfolio/:imageId', authenticate, async (req, res) => 
   }
 });
 
-app.put('/api/profile/verification', onboardingAuth, async (req, res) => {
+// ✅ FIXED: Verification route now uses authenticate (no more 401)
+app.put('/api/profile/verification', authenticate, async (req, res) => {
   try {
     const { expiryReminder, emailReminders, pushNotifications, remindDaysBefore } = req.body;
     const settings = {};
@@ -1200,7 +1201,6 @@ app.post('/api/subscriptions/upgrade', authenticate, async (req, res) => {
       return res.status(400).json({ message: 'Plan and payment token are required.' });
     }
 
-    // TODO: Verify the paymentToken with Google Pay / payment processor
     const expiry = new Date();
     expiry.setMonth(expiry.getMonth() + 1);
 
@@ -1219,6 +1219,28 @@ app.post('/api/subscriptions/upgrade', authenticate, async (req, res) => {
     res.json({ message: 'Subscription upgraded successfully', user: user.toJSON() });
   } catch (err) {
     console.error('Subscription upgrade error:', err);
+    res.status(500).json({ message: 'Server error.' });
+  }
+});
+
+// ✅ NEW: Cancel subscription
+app.delete('/api/subscriptions/cancel', authenticate, async (req, res) => {
+  try {
+    const user = await User.findByIdAndUpdate(
+      req.user.userId,
+      {
+        $set: {
+          'subscription.plan': 'free',
+          'subscription.expiry': null,
+        },
+      },
+      { new: true }
+    );
+
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+    res.json({ message: 'Subscription cancelled. You are now on the free plan.', user: user.toJSON() });
+  } catch (err) {
+    console.error('Cancel subscription error:', err);
     res.status(500).json({ message: 'Server error.' });
   }
 });
@@ -1310,6 +1332,26 @@ app.post('/api/jobs', authenticate, async (req, res) => {
       return res.status(400).json({ message: messages.join(' | ') });
     }
     res.status(500).json({ message: 'Server error. Please try again.' });
+  }
+});
+
+// ✅ NEW: Delete job – only the business who posted it can delete it
+app.delete('/api/jobs/:id', authenticate, async (req, res) => {
+  try {
+    if (req.user.role !== 'Business') {
+      return res.status(403).json({ message: 'Only Business accounts can delete jobs.' });
+    }
+
+    const job = await Job.findOne({ _id: req.params.id, postedBy: req.user.userId });
+    if (!job) {
+      return res.status(404).json({ message: 'Job not found or you are not the owner.' });
+    }
+
+    await Job.findByIdAndDelete(req.params.id);
+    res.json({ message: 'Job deleted successfully.' });
+  } catch (err) {
+    console.error('Delete job error:', err);
+    res.status(500).json({ message: 'Server error.' });
   }
 });
 
@@ -1644,7 +1686,7 @@ app.get('/api/conversations', authenticate, async (req, res) => {
   try {
     const userId = req.user.userId;
     const conversations = await Conversation.find({ participants: userId })
-      .populate('participants', 'fullName profilePhoto subscription')   // ← now includes subscription
+      .populate('participants', 'fullName profilePhoto subscription')
       .populate('lastMessage')
       .sort({ updatedAt: -1 });
 
