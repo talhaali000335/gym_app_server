@@ -222,6 +222,12 @@ const userSchema = new mongoose.Schema(
       showEmailToContacts: { type: Boolean, default: true },
       showPhoneToContacts: { type: Boolean, default: true },
     },
+
+    // Subscription field
+    subscription: {
+      plan:   { type: String, enum: ['free', 'verified', 'premium'], default: 'free' },
+      expiry: { type: Date, default: null },
+    },
   },
   { timestamps: true }
 );
@@ -229,7 +235,7 @@ const userSchema = new mongoose.Schema(
 userSchema.set('toJSON', {
   transform(_doc, ret) {
     delete ret.password;
-    delete ret.twoFactorCode;        // never leak OTP
+    delete ret.twoFactorCode;
     delete ret.twoFactorCodeExpires;
     return ret;
   },
@@ -611,7 +617,6 @@ app.post('/api/register/complete', async (req, res) => {
   }
 });
 
-// ✅ UPDATED: Login with 2FA support
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -623,11 +628,10 @@ app.post('/api/login', async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(401).json({ message: 'Invalid email or password.' });
 
-    // ── 2FA check ────────────────────────────────────────────────
     if (user.twoFactorEnabled) {
       const otp = Math.floor(100000 + Math.random() * 900000).toString();
       user.twoFactorCode = otp;
-      user.twoFactorCodeExpires = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
+      user.twoFactorCodeExpires = new Date(Date.now() + 5 * 60 * 1000);
       await user.save();
 
       if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
@@ -662,7 +666,6 @@ app.post('/api/login', async (req, res) => {
       });
     }
 
-    // No 2FA – normal login
     const token = jwt.sign(
       { userId: user._id, email: user.email, role: user.role, fullName: user.fullName },
       process.env.JWT_SECRET,
@@ -677,7 +680,6 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// ✅ NEW: 2FA verification endpoint
 app.post('/api/verify-2fa', async (req, res) => {
   try {
     const { tempToken, code } = req.body;
@@ -704,12 +706,10 @@ app.post('/api/verify-2fa', async (req, res) => {
       return res.status(400).json({ message: 'Invalid or expired code.' });
     }
 
-    // Clear OTP
     user.twoFactorCode = null;
     user.twoFactorCodeExpires = null;
     await user.save();
 
-    // Issue final JWT
     const token = jwt.sign(
       { userId: user._id, email: user.email, role: user.role, fullName: user.fullName },
       process.env.JWT_SECRET,
@@ -724,10 +724,9 @@ app.post('/api/verify-2fa', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  SOCIAL AUTH ROUTES  (Google, Facebook, X)
+//  SOCIAL AUTH ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Google Sign-In
 app.post('/api/auth/google', async (req, res) => {
   try {
     const { idToken } = req.body;
@@ -770,7 +769,6 @@ app.post('/api/auth/google', async (req, res) => {
   }
 });
 
-// Facebook (Meta) Sign-In
 app.post('/api/auth/facebook', async (req, res) => {
   try {
     const { accessToken } = req.body;
@@ -815,7 +813,6 @@ app.post('/api/auth/facebook', async (req, res) => {
   }
 });
 
-// X (Twitter) Sign-In
 app.post('/api/auth/x', async (req, res) => {
   try {
     const { accessToken } = req.body;
@@ -866,7 +863,7 @@ app.post('/api/auth/x', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  FORGOT / RESET PASSWORD  (real email sending)
+//  FORGOT / RESET PASSWORD
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/api/forgot-password', async (req, res) => {
@@ -973,7 +970,6 @@ app.get('/api/profile', authenticate, async (req, res) => {
   }
 });
 
-// ── FCM token update ──────────────────────────────────────────────────────────
 app.put('/api/users/me/token', authenticate, async (req, res) => {
   try {
     const { fcmToken } = req.body;
@@ -987,7 +983,7 @@ app.put('/api/users/me/token', authenticate, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  PROFILE SETUP ROUTES (location, qualifications, portfolio, verification, security)
+//  PROFILE SETUP ROUTES
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.put('/api/profile/location', authenticate, async (req, res) => {
@@ -1120,7 +1116,6 @@ app.put('/api/profile/verification', onboardingAuth, async (req, res) => {
   }
 });
 
-// ✅ UPDATED: Security & Privacy endpoint
 app.put('/api/profile/security', authenticate, async (req, res) => {
   try {
     const { twoFactorEnabled, privacySettings } = req.body;
@@ -1191,6 +1186,40 @@ app.put('/api/profile', authenticate, upload.single('profilePhoto'), async (req,
       return res.status(400).json({ message: messages.join(' | ') });
     }
     res.status(500).json({ message: 'Server error. Please try again.' });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SUBSCRIPTION UPGRADE ROUTE
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.post('/api/subscriptions/upgrade', authenticate, async (req, res) => {
+  try {
+    const { plan, paymentToken } = req.body;
+    if (!plan || !paymentToken) {
+      return res.status(400).json({ message: 'Plan and payment token are required.' });
+    }
+
+    // TODO: Verify the paymentToken with Google Pay / payment processor
+    const expiry = new Date();
+    expiry.setMonth(expiry.getMonth() + 1);
+
+    const user = await User.findByIdAndUpdate(
+      req.user.userId,
+      {
+        $set: {
+          'subscription.plan': plan,
+          'subscription.expiry': expiry,
+        },
+      },
+      { new: true }
+    );
+
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+    res.json({ message: 'Subscription upgraded successfully', user: user.toJSON() });
+  } catch (err) {
+    console.error('Subscription upgrade error:', err);
+    res.status(500).json({ message: 'Server error.' });
   }
 });
 
@@ -1615,7 +1644,7 @@ app.get('/api/conversations', authenticate, async (req, res) => {
   try {
     const userId = req.user.userId;
     const conversations = await Conversation.find({ participants: userId })
-      .populate('participants', 'fullName profilePhoto')
+      .populate('participants', 'fullName profilePhoto subscription')   // ← now includes subscription
       .populate('lastMessage')
       .sort({ updatedAt: -1 });
 
