@@ -249,6 +249,9 @@ const availabilitySlotSchema = new mongoose.Schema({
   note:   { type: String, default: '' },
 }, { _id: true });
 
+// ══════════════════════════════════════════════════════════════════════════════
+//  JOB SCHEMA  (added coordinates)
+// ══════════════════════════════════════════════════════════════════════════════
 const jobSchema = new mongoose.Schema(
   {
     title:            { type: String, required: true, trim: true },
@@ -268,6 +271,11 @@ const jobSchema = new mongoose.Schema(
     maxSlots:              { type: Number, default: 16 },
     filledSlots:           { type: Number, default: 0 },
     availabilityCalendar:  [availabilitySlotSchema],
+    // ── NEW: coordinates for distance calculation ─────────────────────
+    coordinates: {
+      latitude:  { type: Number, default: null },
+      longitude: { type: Number, default: null },
+    },
   },
   { timestamps: true }
 );
@@ -359,6 +367,19 @@ reviewSchema.index({ business: 1, createdAt: -1 });
 reviewSchema.index({ reviewer: 1, business: 1 }, { unique: true });
 const Review = mongoose.model('Review', reviewSchema);
 
+// ✅ NEW: Feedback schema
+const feedbackSchema = new mongoose.Schema(
+  {
+    rating:    { type: Number, required: true, min: 1, max: 5 },
+    message:   { type: String, required: true },
+    user:      { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    userName:  { type: String, default: 'Anonymous' },
+    userEmail: { type: String, default: null },
+  },
+  { timestamps: true }
+);
+const Feedback = mongoose.model('Feedback', feedbackSchema);
+
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 const uploadToCloudinary = (buffer, folder, resource_type = 'auto') =>
@@ -376,6 +397,30 @@ const getMessageType = (mimetype) => {
   if (mimetype.startsWith('audio/')) return 'audio';
   return 'file';
 };
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  NEW: Haversine distance helper
+// ══════════════════════════════════════════════════════════════════════════════
+function getDistanceKm(lat1, lon1, lat2, lon2) {
+  const R = 6371; // Earth radius in km
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1 * Math.PI / 180) *
+      Math.cos(lat2 * Math.PI / 180) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+function formatDistance(km) {
+  if (km < 1) {
+    return `${(km * 1000).toFixed(0)} m`;
+  }
+  return `${km.toFixed(1)} km`;
+}
 
 // ── Authentication middleware ──────────────────────────────────────────────────
 const authenticate = (req, res, next) => {
@@ -1223,7 +1268,7 @@ app.post('/api/subscriptions/upgrade', authenticate, async (req, res) => {
   }
 });
 
-// ✅ NEW: Cancel subscription
+// ✅ Cancel subscription
 app.delete('/api/subscriptions/cancel', authenticate, async (req, res) => {
   try {
     const user = await User.findByIdAndUpdate(
@@ -1246,7 +1291,7 @@ app.delete('/api/subscriptions/cancel', authenticate, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  JOB ROUTES
+//  JOB ROUTES  (DISTANCE FILTER ADDED)
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/api/jobs', async (req, res) => {
@@ -1255,21 +1300,56 @@ app.get('/api/jobs', async (req, res) => {
     const limit = Math.min(50, parseInt(req.query.limit) || 10);
     const skip  = (page - 1) * limit;
 
-    const [jobs, totalCount] = await Promise.all([
-      Job.find()
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit)
-        .populate('postedBy', 'fullName email'),
-      Job.countDocuments(),
-    ]);
+    const userLat = parseFloat(req.query.userLat);
+    const userLng = parseFloat(req.query.userLng);
+    const maxDistance = parseFloat(req.query.maxDistance);
+    const hasUserCoords = !isNaN(userLat) && !isNaN(userLng);
+    const hasMaxDistance = !isNaN(maxDistance) && maxDistance > 0;
+
+    // Build query: if filtering by distance, only fetch jobs that have coordinates
+    let query = {};
+    if (hasUserCoords && hasMaxDistance) {
+      query['coordinates.latitude'] = { $exists: true, $ne: null };
+      query['coordinates.longitude'] = { $exists: true, $ne: null };
+    }
+
+    let jobs = await Job.find(query)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .populate('postedBy', 'fullName email');
+
+    // Calculate distance for each job and attach formatted string
+    let processedJobs = jobs.map(job => {
+      const jobObj = job.toObject();
+      if (hasUserCoords && job.coordinates?.latitude != null && job.coordinates?.longitude != null) {
+        const distKm = getDistanceKm(userLat, userLng, job.coordinates.latitude, job.coordinates.longitude);
+        jobObj.distance = formatDistance(distKm);
+        jobObj._distanceValue = distKm; // for filtering
+      } else {
+        jobObj.distance = jobObj.distance || '';
+        jobObj._distanceValue = null;
+      }
+      return jobObj;
+    });
+
+    // Apply maxDistance filter
+    if (hasUserCoords && hasMaxDistance) {
+      processedJobs = processedJobs.filter(j => j._distanceValue != null && j._distanceValue <= maxDistance);
+    }
+
+    // Clean up internal field before sending
+    processedJobs.forEach(j => delete j._distanceValue);
+
+    const totalCount = await Job.countDocuments(query);
+    const hasMore = page < Math.ceil(totalCount / limit);
 
     res.json({
-      jobs,
+      jobs: processedJobs,
       currentPage: page,
-      totalPages:  Math.ceil(totalCount / limit),
+      totalPages: Math.ceil(totalCount / limit),
       totalCount,
-      hasMore:     page < Math.ceil(totalCount / limit),
+      hasMore,
     });
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -1294,7 +1374,7 @@ app.post('/api/jobs', authenticate, async (req, res) => {
     const {
       title, company, location, salary, jobType, workingPlaceType,
       description, requirements, schedule, rate, distance, maxClients,
-      coverTime, maxSlots,
+      coverTime, maxSlots, latitude, longitude,
     } = req.body;
 
     if (!title || !company || !location || !salary || !jobType)
@@ -1304,6 +1384,10 @@ app.post('/api/jobs', authenticate, async (req, res) => {
       title, company, location, salary, jobType, workingPlaceType,
       description, requirements, schedule, rate, distance, maxClients,
       coverTime, maxSlots: maxSlots || 16,
+      coordinates: {
+        latitude: latitude != null ? Number(latitude) : null,
+        longitude: longitude != null ? Number(longitude) : null,
+      },
       postedBy: req.user.userId,
     });
 
@@ -1335,7 +1419,7 @@ app.post('/api/jobs', authenticate, async (req, res) => {
   }
 });
 
-// ✅ NEW: Delete job – only the business who posted it can delete it
+// ✅ Delete job – only the business who posted it can delete it
 app.delete('/api/jobs/:id', authenticate, async (req, res) => {
   try {
     if (req.user.role !== 'Business') {
@@ -1947,6 +2031,46 @@ app.patch('/api/conversations/:id/read', authenticate, async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ message: err.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  FEEDBACK ROUTE (NEW)
+// ══════════════════════════════════════════════════════════════════════════════
+app.post('/api/feedback', async (req, res) => {
+  try {
+    const { rating, message } = req.body;
+    if (!rating || !message) {
+      return res.status(400).json({ message: 'Rating and message are required.' });
+    }
+
+    // Try to extract user info from token if provided
+    let user = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      try {
+        const token = authHeader.split(' ')[1];
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        user = await User.findById(decoded.userId).select('email fullName');
+      } catch (_) {
+        // ignore invalid tokens – feedback still accepted
+      }
+    }
+
+    const feedback = new Feedback({
+      rating,
+      message,
+      user: user ? user._id : null,
+      userName: user ? user.fullName : 'Anonymous',
+      userEmail: user ? user.email : null,
+    });
+    await feedback.save();
+
+    console.log(`📢 Feedback from ${user ? user.email : 'anonymous'} – Rating: ${rating}`);
+    res.status(201).json({ message: 'Thank you for your feedback!' });
+  } catch (err) {
+    console.error('Feedback error:', err);
+    res.status(500).json({ message: 'Server error.' });
   }
 });
 
